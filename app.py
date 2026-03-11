@@ -4,7 +4,11 @@ Generates realistic weekly events for interns using local Ollama models.
 """
 
 import streamlit as st
-from generator import get_available_models, generate_events
+from generator import (
+    generate_events,
+    get_available_models,
+    get_last_generation_warning,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -97,6 +101,15 @@ with st.sidebar:
             step=1,
         )
 
+    deliverables_per_event = st.number_input(
+        "Required Deliverables per Event",
+        min_value=1,
+        max_value=5,
+        value=2,
+        step=1,
+        help="Keep this low for concise outputs.",
+    )
+
     st.divider()
 
     # Cross-discipline references (only for all-disciplines mode)
@@ -157,6 +170,7 @@ def run_generation(
     feedback_text: str | None = None,
 ):
     """Stream generation into the given container. Returns the full text or None."""
+    warning_area = container.empty()
     output_area = container.empty()
     full_response = ""
 
@@ -172,6 +186,7 @@ def run_generation(
             feedback=feedback_text,
             start_week=start_week,
             cross_reference=cross_reference,
+            deliverables_per_event=int(deliverables_per_event),
         ):
             full_response += token
             output_area.markdown(full_response)
@@ -182,6 +197,10 @@ def run_generation(
             "available. You can pull a model with: ollama pull <model-name>"
         )
         return None
+
+    warning_text = get_last_generation_warning()
+    if warning_text:
+        warning_area.warning(warning_text)
 
     return full_response if full_response else None
 

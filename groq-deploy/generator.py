@@ -3,6 +3,8 @@ Groq-based event generator for the intern simulator.
 Handles prompt construction and model interaction via the Groq cloud API.
 """
 
+import re
+
 import streamlit as st
 from groq import Groq
 
@@ -75,7 +77,10 @@ DISCIPLINE_GUIDANCE = {
         "The intern must figure out the 'so what?' — why it matters, what "
         "caused it, what it means for the project, and what to recommend. "
         "Do NOT provide the analysis. Present the raw intelligence and let "
-        "the intern work."
+        "the intern work.\n\n"
+        "Every Business event should also require a short analysis deliverable: "
+        "a concise situational-awareness or geopolitical impact report that "
+        "explains why the event matters to the project."
     ),
     "Systems Engineer": (
         "The Systems Engineer intern works within a MODEL-BASED SYSTEMS ENGINEERING "
@@ -98,7 +103,10 @@ DISCIPLINE_GUIDANCE = {
         "Events should reflect MBSE thinking: model-driven, requirements-traceable, "
         "and focused on systems, interfaces, and traceability. When generated "
         "alongside Business events, the SE event should be a direct consequence "
-        "of what Business discovered."
+        "of what Business discovered.\n\n"
+        "Every Systems Engineer event should require a short engineering-change "
+        "deliverable: requirement impact analysis, interface change proposal, "
+        "or architecture update rationale tied to the scenario."
     ),
     "Developer": (
         "The Developer intern builds features and capabilities driven by project "
@@ -122,9 +130,15 @@ DISCIPLINE_GUIDANCE = {
         "Events should be about BUILDING or CHANGING things — new features, "
         "integrations, fixes, or improvements. When generated alongside SE "
         "events, the Developer event should stem from what the SE designed "
-        "or discovered. Not every event requires code, but most should."
+        "or discovered. Not every event requires code, but most should.\n\n"
+        "Every Developer event should require a brief technical deliverable: "
+        "for example a scaling approach memo, implementation tradeoff summary, "
+        "or design note describing how to build the needed capability."
     ),
 }
+
+DISCIPLINE_ORDER = ["Business", "Systems Engineer", "Developer"]
+LAST_GENERATION_WARNING: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +157,10 @@ EVENT_FORMAT = (
     "references grounded in the project context. Do NOT tell the intern what "
     "to do or how to solve it. Present the situation and let them figure out "
     "the response. One to three paragraphs.]\n\n"
-    "**Deliverables:**\n"
-    "- [What the intern needs to produce or present by end of week]\n"
-    "- [Keep these outcome-focused, not step-by-step instructions]\n\n"
+    "**Required Deliverables:**\n"
+    "- [Deliverable name] — [artifact type such as MBSE model update, "
+    "Word/Google doc brief, slide deck, diagram, spreadsheet, etc.]\n"
+    "- [Deliverables must state WHAT is submitted, not HOW to produce it]\n\n"
     "---\n\n"
     "Rules:\n"
     "- Do NOT include tasks, steps, solutions, or hints.\n"
@@ -213,9 +228,142 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
         "- Use plain, professional language.\n"
         "- NEVER include preamble, questions, or commentary.\n"
         "- Your first line of output MUST be '## Week'.\n"
+        "- Every event MUST include a '**Discipline:**' line.\n"
+        "- Week headers must use integer numbering only (Week 1, Week 2, ...).\n"
     )
 
     return base
+
+
+def get_last_generation_warning() -> str | None:
+    """Return warning text from last generation attempt, if any."""
+    return LAST_GENERATION_WARNING
+
+
+def _split_week_blocks(text: str) -> list[tuple[int, str]]:
+    """
+    Split output into week blocks.
+    Returns list of (week_number, block_text).
+    """
+    pattern = re.compile(r"(?m)^##\s*Week\s+(\d+)[^\n]*\n")
+    matches = list(pattern.finditer(text))
+    blocks: list[tuple[int, str]] = []
+    for i, match in enumerate(matches):
+        week_number = int(match.group(1))
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        blocks.append((week_number, text[start:end].strip()))
+    return blocks
+
+
+def _extract_discipline(block_text: str) -> str | None:
+    match = re.search(
+        r"(?im)^\*\*Discipline:\*\*\s*(Business|Systems Engineer|Developer)\s*$",
+        block_text,
+    )
+    return match.group(1) if match else None
+
+
+def _validate_output_shape(
+    text: str,
+    mode: str,
+    discipline: str | None,
+    num_weeks: int,
+    start_week: int,
+) -> tuple[bool, list[str]]:
+    """
+    Validate generated output for week continuity and discipline consistency.
+    """
+    errors: list[str] = []
+    blocks = _split_week_blocks(text)
+    if not blocks:
+        return False, ["No valid '## Week N' sections were found."]
+
+    expected_weeks = list(range(start_week, start_week + num_weeks))
+
+    if mode in {"single", "set"}:
+        if len(blocks) != num_weeks:
+            errors.append(
+                f"Expected {num_weeks} week section(s), found {len(blocks)}."
+            )
+
+        got_weeks = [week for week, _ in blocks]
+        if got_weeks != expected_weeks:
+            errors.append(
+                f"Week numbering mismatch. Expected {expected_weeks}, got {got_weeks}."
+            )
+
+        if discipline:
+            for idx, (_, block) in enumerate(blocks, start=1):
+                block_discipline = _extract_discipline(block)
+                if block_discipline != discipline:
+                    errors.append(
+                        f"Week block {idx} has discipline '{block_discipline}', "
+                        f"expected '{discipline}'."
+                    )
+
+    else:
+        expected_count = num_weeks * 3
+        if len(blocks) != expected_count:
+            errors.append(
+                f"Expected {expected_count} sections for all-disciplines mode, "
+                f"found {len(blocks)}."
+            )
+
+        week_counts: dict[int, int] = {}
+        week_to_disciplines: dict[int, set[str]] = {}
+        week_discipline_order: dict[int, list[str]] = {}
+        for week, block in blocks:
+            week_counts[week] = week_counts.get(week, 0) + 1
+            disc = _extract_discipline(block)
+            if disc:
+                week_to_disciplines.setdefault(week, set()).add(disc)
+                week_discipline_order.setdefault(week, []).append(disc)
+
+        for week in expected_weeks:
+            if week_counts.get(week, 0) != 3:
+                errors.append(
+                    f"Week {week} should appear 3 times, found "
+                    f"{week_counts.get(week, 0)}."
+                )
+            found = week_to_disciplines.get(week, set())
+            if found != set(DISCIPLINE_ORDER):
+                errors.append(
+                    f"Week {week} discipline set mismatch. "
+                    f"Expected {DISCIPLINE_ORDER}, got {sorted(found)}."
+                )
+            order = week_discipline_order.get(week, [])
+            if order != DISCIPLINE_ORDER:
+                errors.append(
+                    f"Week {week} discipline order mismatch. "
+                    f"Expected {DISCIPLINE_ORDER}, got {order}."
+                )
+
+    return len(errors) == 0, errors
+
+
+def _build_repair_prompt(
+    original_prompt: str,
+    invalid_output: str,
+    errors: list[str],
+) -> str:
+    """Prompt used to repair invalid output format/content boundaries."""
+    joined_errors = "\n".join(f"- {error}" for error in errors)
+    return (
+        "Your previous answer violated formatting or consistency constraints.\n\n"
+        "You MUST rewrite the full answer from scratch using the original task.\n"
+        "Do not explain. Do not apologize. Output only corrected events.\n\n"
+        "--- ORIGINAL TASK ---\n"
+        f"{original_prompt}\n"
+        "--- END ORIGINAL TASK ---\n\n"
+        "--- VALIDATION ERRORS TO FIX ---\n"
+        f"{joined_errors}\n"
+        "--- END VALIDATION ERRORS ---\n\n"
+        "--- INVALID OUTPUT (FOR REFERENCE) ---\n"
+        f"{invalid_output}\n"
+        "--- END INVALID OUTPUT ---\n\n"
+        "Now provide only the corrected markdown events."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +424,7 @@ def _build_single_event_prompt(
     previous_events: str | None = None,
     feedback: str | None = None,
     week_number: int | None = None,
+    deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
     week_label = f"Week {week_number}" if week_number else "a week"
@@ -288,6 +437,9 @@ def _build_single_event_prompt(
         f"Stop after the first horizontal rule (---).\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for {discipline}:\n{guidance}\n\n"
+        f"Required deliverable count for this event: {deliverables_per_event}. "
+        f"Produce exactly {deliverables_per_event} bullet item(s) under "
+        f"'**Required Deliverables:**'.\n\n"
         f"{EVENT_FORMAT}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
@@ -313,6 +465,7 @@ def _build_set_prompt(
     previous_events: str | None = None,
     feedback: str | None = None,
     start_week: int = 1,
+    deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
     end_week = start_week + num_weeks - 1
@@ -326,6 +479,9 @@ def _build_set_prompt(
         f"The events must form a continuous narrative over {num_weeks} weeks. "
         f"Later events should be consequences of, or build on, earlier ones. "
         f"The project is alive — things happen because of what came before.\n\n"
+        f"Required deliverable count per event: {deliverables_per_event}. "
+        f"Each event must include exactly {deliverables_per_event} bullet "
+        f"item(s) under '**Required Deliverables:**'.\n\n"
         f"{EVENT_FORMAT}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
@@ -348,6 +504,7 @@ def _build_all_disciplines_prompt(
     feedback: str | None = None,
     start_week: int = 1,
     cross_reference: bool = False,
+    deliverables_per_event: int = 2,
 ) -> str:
     all_guidance = "\n\n".join(
         f"### {disc}\n{g}" for disc, g in DISCIPLINE_GUIDANCE.items()
@@ -371,6 +528,11 @@ def _build_all_disciplines_prompt(
         f"# Week N\n"
         f"Show the Business event, then Systems Engineer event, then Developer "
         f"event for that week. Then move to the next week.\n\n"
+        f"STRICT ORDER: Within each week, the event order must be exactly: "
+        f"Business, then Systems Engineer, then Developer.\n\n"
+        f"Required deliverable count per event: {deliverables_per_event}. "
+        f"Each event must include exactly {deliverables_per_event} bullet "
+        f"item(s) under '**Required Deliverables:**'.\n\n"
         f"{EVENT_FORMAT}"
     )
     if cross_reference:
@@ -421,6 +583,7 @@ def generate_events(
     feedback: str | None = None,
     start_week: int = 1,
     cross_reference: bool = False,
+    deliverables_per_event: int = 2,
 ):
     """
     Generator that yields streamed text from Groq.
@@ -448,39 +611,70 @@ def generate_events(
     cross_reference : bool
         Whether same-week events across disciplines should reference each other.
     """
+    global LAST_GENERATION_WARNING
+    LAST_GENERATION_WARNING = None
+
     codebase_context = _read_uploaded_files(uploaded_files)
 
     if mode == "single":
         user_prompt = _build_single_event_prompt(
             project_description, discipline, codebase_context,
-            previous_events, feedback, start_week,
+            previous_events, feedback, start_week, deliverables_per_event,
         )
     elif mode == "set":
         user_prompt = _build_set_prompt(
             project_description, discipline, num_weeks, codebase_context,
-            previous_events, feedback, start_week,
+            previous_events, feedback, start_week, deliverables_per_event,
         )
     else:
         user_prompt = _build_all_disciplines_prompt(
             project_description, num_weeks, codebase_context,
             previous_events, feedback, start_week, cross_reference,
+            deliverables_per_event,
         )
 
-    messages = [
-        {"role": "system", "content": _build_system_prompt(mode, discipline)},
-        {"role": "user", "content": user_prompt},
-    ]
-
+    system_prompt = _build_system_prompt(mode, discipline)
+    final_output = ""
+    max_attempts = 3
+    current_prompt = user_prompt
     client = _get_client()
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta and delta.content:
-            yield delta.content
+
+    for attempt in range(1, max_attempts + 1):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": current_prompt},
+        ]
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+        )
+        candidate = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                candidate += delta.content
+
+        is_valid, errors = _validate_output_shape(
+            text=candidate,
+            mode=mode,
+            discipline=discipline,
+            num_weeks=num_weeks,
+            start_week=start_week,
+        )
+        final_output = candidate
+        if is_valid:
+            break
+        if attempt < max_attempts:
+            current_prompt = _build_repair_prompt(user_prompt, candidate, errors)
+        else:
+            LAST_GENERATION_WARNING = (
+                "Output had formatting consistency issues after retries. "
+                "Showing best attempt."
+            )
+
+    for i in range(0, len(final_output), 120):
+        yield final_output[i:i + 120]
 
 
 
