@@ -1,5 +1,5 @@
 """
-Local HTTP API for week-by-week generation orchestration.
+Local HTTP API for event-by-event generation orchestration.
 """
 
 from __future__ import annotations
@@ -31,18 +31,18 @@ def _parse_events_payload(content: str | None) -> list[dict]:
     return events if isinstance(events, list) else []
 
 
-def _generate_single_week(payload: dict) -> dict:
+def _generate_single_event(payload: dict) -> dict:
     content = ""
     for token in generate_events(
         model=payload["model"],
         project_description=payload["project_description"],
         mode=payload["mode"],
         discipline=payload.get("discipline"),
-        num_weeks=1,
+        num_events=1,
         uploaded_files=None,
         previous_events=payload.get("previous_events"),
         feedback=payload.get("feedback"),
-        start_week=int(payload["start_week"]),
+        start_event=int(payload["start_event"]),
         cross_reference=bool(payload.get("cross_reference", False)),
         deliverables_per_event=int(payload.get("deliverables_per_event", 2)),
         codebase_context=payload.get("codebase_context"),
@@ -60,31 +60,30 @@ def _generate_single_week(payload: dict) -> dict:
         "content": content,
         "events": events,
         "warning": get_last_generation_warning(),
-        "week_generated": int(payload["start_week"]),
+        "event_generated": int(payload["start_event"]),
         "mode_used": payload["mode"],
     }
 
 
-def _generate_multiweek(payload: dict) -> dict:
-    total_weeks = int(payload["num_weeks"])
-    start_week = int(payload["start_week"])
+def _generate_multievent(payload: dict) -> dict:
+    total_events = int(payload["num_events"])
+    start_event = int(payload["start_event"])
     current_previous = payload.get("previous_events")
     events_accum: list[dict] = _parse_events_payload(current_previous)
     warnings: list[str] = []
 
-    for offset in range(total_weeks):
-        week_payload = {
+    for offset in range(total_events):
+        event_payload = {
             **payload,
-            "start_week": start_week + offset,
+            "start_event": start_event + offset,
             "previous_events": current_previous,
         }
-        week_result = _generate_single_week(week_payload)
-        content = week_result["content"]
-        week_events = week_result.get("events") or []
-        events_accum.extend(week_events)
-        if week_result["warning"]:
+        event_result = _generate_single_event(event_payload)
+        event_entries = event_result.get("events") or []
+        events_accum.extend(event_entries)
+        if event_result["warning"]:
             warnings.append(
-                f"Week {week_result['week_generated']}: {week_result['warning']}"
+                f"Event {event_result['event_generated']}: {event_result['warning']}"
             )
         current_previous = (
             json.dumps({"events": events_accum}, ensure_ascii=True)
@@ -94,7 +93,7 @@ def _generate_multiweek(payload: dict) -> dict:
         "content": json.dumps({"events": events_accum}, ensure_ascii=True, indent=2),
         "events": events_accum,
         "warning": "\n".join(warnings) if warnings else None,
-        "weeks_generated": total_weeks,
+        "events_generated": total_events,
         "mode_used": payload["mode"],
     }
 
@@ -113,8 +112,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            if self.path == "/generate-week":
-                required = ["model", "project_description", "mode", "start_week"]
+            if self.path in {"/generate-event", "/generate-week"}:
+                required = ["model", "project_description", "mode", "start_event"]
                 missing = [key for key in required if key not in payload]
                 if missing:
                     self._respond(
@@ -122,17 +121,17 @@ class _Handler(BaseHTTPRequestHandler):
                         {"error": f"Missing required field(s): {', '.join(missing)}"},
                     )
                     return
-                result = _generate_single_week(payload)
+                result = _generate_single_event(payload)
                 self._respond(HTTPStatus.OK, result)
                 return
 
-            if self.path == "/generate-multiweek":
+            if self.path in {"/generate-multievent", "/generate-multiweek"}:
                 required = [
                     "model",
                     "project_description",
                     "mode",
-                    "start_week",
-                    "num_weeks",
+                    "start_event",
+                    "num_events",
                 ]
                 missing = [key for key in required if key not in payload]
                 if missing:
@@ -141,7 +140,7 @@ class _Handler(BaseHTTPRequestHandler):
                         {"error": f"Missing required field(s): {', '.join(missing)}"},
                     )
                     return
-                result = _generate_multiweek(payload)
+                result = _generate_multievent(payload)
                 self._respond(HTTPStatus.OK, result)
                 return
 
@@ -191,9 +190,9 @@ def start_local_api_server() -> int:
         return _SERVER_PORT
 
 
-def request_generate_week(payload: dict) -> dict:
+def request_generate_event(payload: dict) -> dict:
     port = start_local_api_server()
-    url = f"http://{_HOST}:{port}/generate-week"
+    url = f"http://{_HOST}:{port}/generate-event"
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
         url,
@@ -207,3 +206,13 @@ def request_generate_week(payload: dict) -> dict:
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Generation API request failed ({exc.code}): {detail}") from exc
+
+
+def request_generate_week(payload: dict) -> dict:
+    """Backward-compatible alias for older callers."""
+    bridged = dict(payload)
+    if "start_week" in bridged and "start_event" not in bridged:
+        bridged["start_event"] = bridged["start_week"]
+    if "num_weeks" in bridged and "num_events" not in bridged:
+        bridged["num_events"] = bridged["num_weeks"]
+    return request_generate_event(bridged)
