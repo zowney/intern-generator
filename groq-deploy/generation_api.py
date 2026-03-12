@@ -20,6 +20,17 @@ _SERVER_PORT: int | None = None
 _LOCK = threading.Lock()
 
 
+def _parse_events_payload(content: str | None) -> list[dict]:
+    if not content:
+        return []
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    events = parsed.get("events")
+    return events if isinstance(events, list) else []
+
+
 def _generate_single_week(payload: dict) -> dict:
     content = ""
     for token in generate_events(
@@ -37,9 +48,17 @@ def _generate_single_week(payload: dict) -> dict:
         codebase_context=payload.get("codebase_context"),
     ):
         content += token
+    content = (content or "").strip()
+    if not content:
+        raise RuntimeError("Generator returned empty JSON content.")
+    parsed = json.loads(content)
+    events = parsed.get("events")
+    if not isinstance(events, list):
+        raise RuntimeError("Generator output missing 'events' array.")
 
     return {
         "content": content,
+        "events": events,
         "warning": get_last_generation_warning(),
         "week_generated": int(payload["start_week"]),
         "mode_used": payload["mode"],
@@ -50,7 +69,7 @@ def _generate_multiweek(payload: dict) -> dict:
     total_weeks = int(payload["num_weeks"])
     start_week = int(payload["start_week"])
     current_previous = payload.get("previous_events")
-    chunks: list[str] = []
+    events_accum: list[dict] = _parse_events_payload(current_previous)
     warnings: list[str] = []
 
     for offset in range(total_weeks):
@@ -61,17 +80,19 @@ def _generate_multiweek(payload: dict) -> dict:
         }
         week_result = _generate_single_week(week_payload)
         content = week_result["content"]
-        chunks.append(content)
+        week_events = week_result.get("events") or []
+        events_accum.extend(week_events)
         if week_result["warning"]:
             warnings.append(
                 f"Week {week_result['week_generated']}: {week_result['warning']}"
             )
         current_previous = (
-            f"{current_previous}\n\n{content}" if current_previous else content
+            json.dumps({"events": events_accum}, ensure_ascii=True)
         )
 
     return {
-        "content": "\n\n".join(chunks),
+        "content": json.dumps({"events": events_accum}, ensure_ascii=True, indent=2),
+        "events": events_accum,
         "warning": "\n".join(warnings) if warnings else None,
         "weeks_generated": total_weeks,
         "mode_used": payload["mode"],

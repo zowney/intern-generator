@@ -3,6 +3,7 @@ Ollama-based event generator for the intern simulator.
 Handles prompt construction and model interaction.
 """
 
+import json
 import re
 
 import ollama
@@ -125,40 +126,61 @@ LAST_GENERATION_WARNING: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Output format template
+# Output JSON contract
 # ---------------------------------------------------------------------------
 
+REFERENCE_DEFENSE_KEYWORDS = [
+    "CDRL",
+    "DID",
+    "CONOPS",
+    "ICD",
+    "SRD",
+    "TEMP",
+    "PDR",
+    "CDR",
+]
+
+REFERENCE_CONTRACT_KEYWORDS = [
+    "briefing",
+    "memo",
+    "report",
+    "analysis",
+]
+
 EVENT_FORMAT = (
-    "Format each event using this structure:\n\n"
-    "## Week N: [Short, descriptive title]\n\n"
-    "**Discipline:** [Business / Systems Engineer / Developer]\n\n"
-    "**Scenario:**\n"
-    "[Describe what happened or what situation has arisen. Write this as if "
-    "the intern is being briefed about something that just occurred — an "
-    "observation, a discovery, a change, a problem, or an opportunity. "
-    "Be SPECIFIC: use concrete details, numbers, names of systems, real-world "
-    "references grounded in the project context. Do NOT tell the intern what "
-    "to do or how to solve it. Present the situation and let them figure out "
-    "the response. One to three paragraphs.]\n\n"
-    "**Required Deliverables:**\n"
-    "- [Deliverable name] — [artifact type such as MBSE model update, "
-    "Word/Google doc brief, slide deck, diagram, spreadsheet, etc.]\n"
-    "- [Deliverables must state WHAT is submitted, not HOW to produce it]\n\n"
-    "---\n\n"
+    "Output STRICT JSON only. Do not use markdown fences.\n\n"
+    "Use exactly this top-level object shape:\n"
+    "{\n"
+    '  "events": [\n'
+    "    {\n"
+    '      "week": <integer>,\n'
+    '      "title": "<short descriptive title>",\n'
+    '      "discipline": "<Business|Systems Engineer|Developer>",\n'
+    '      "scenario": "<1-3 paragraph scenario text>",\n'
+    '      "deliverables": [\n'
+    "        {\n"
+    '          "artifact": "<what is submitted>",\n'
+    '          "purpose": "<why it is needed>",\n'
+    '          "required_contents": "<specific required sections or data>",\n'
+    '          "audience": "<intended reviewer/consumer>",\n'
+    '          "reference": "<must include one defense reference and one contract-style artifact>"\n'
+    "        }\n"
+    "      ]\n"
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
     "Rules:\n"
-    "- Do NOT include tasks, steps, solutions, or hints.\n"
-    "- The scenario should read like a real event that triggers action.\n"
-    "- Deliverables describe WHAT is needed, not HOW to do it.\n"
-    "- Separate events with a horizontal rule (---).\n"
-    "- Do not use emojis. Use plain, professional language."
+    "- Never include tasks, steps, or solution hints.\n"
+    "- Scenario must describe what happened, not how to solve it.\n"
+    "- Deliverables must be concrete outputs and must vary week-to-week.\n"
+    "- Every reference must mention one of: CDRL, DID, CONOPS, ICD, SRD, TEMP, PDR, CDR.\n"
+    "- Every reference must also mention one of: briefing, memo, report, analysis.\n"
+    "- Use plain, professional language with no emojis."
 )
 
-# Appended to the very end of every user prompt to force compliance
 PROMPT_CLOSER = (
-    "\n\nIMPORTANT: Do NOT ask any questions. Do NOT add any introduction, "
-    "commentary, or explanation. You have everything you need above. "
-    "Begin your response IMMEDIATELY with '## Week' and generate the events. "
-    "Your very first characters must be '## Week'."
+    "\n\nIMPORTANT: Do NOT ask questions or add commentary. "
+    "Return JSON only. Your first character must be '{'."
 )
 
 
@@ -169,13 +191,13 @@ PROMPT_CLOSER = (
 def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
     base = (
         "You are a project simulation engine. You ONLY output event content "
-        "in markdown format. You NEVER ask questions. You NEVER add commentary, "
+        "as strict JSON. You NEVER ask questions. You NEVER add commentary, "
         "introductions, or explanations. You NEVER say things like 'Let me know' "
         "or 'What kind of project'. You have all the information you need in the "
         "user message.\n\n"
         "Your SOLE job: read the project description provided and immediately "
-        "output events in the exact markdown format specified. Start your "
-        "response with '## Week' — nothing before it.\n\n"
+        "output events in the exact JSON format specified. Start your "
+        "response with '{' — nothing before it.\n\n"
         "You simulate a living, evolving project by generating weekly events — "
         "things that HAPPEN — that interns must respond to. You are NOT "
         "generating task lists. You are generating realistic scenarios.\n\n"
@@ -210,9 +232,8 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
         "- Do not use emojis anywhere.\n"
         "- Use plain, professional language.\n"
         "- NEVER include preamble, questions, or commentary.\n"
-        "- Your first line of output MUST be '## Week'.\n"
-        "- Every event MUST include a '**Discipline:**' line.\n"
-        "- Week headers must use integer numbering only (Week 1, Week 2, ...).\n"
+        "- Output must be valid JSON with a top-level 'events' array.\n"
+        "- Week values must use integer numbering only.\n"
     )
 
     return base
@@ -223,85 +244,190 @@ def get_last_generation_warning() -> str | None:
     return LAST_GENERATION_WARNING
 
 
-def _split_week_blocks(text: str) -> list[tuple[int, str]]:
-    """
-    Split output into week blocks.
-    Returns list of (week_number, block_text).
-    """
-    pattern = re.compile(r"(?m)^##\s*Week\s+(\d+)[^\n]*\n")
-    matches = list(pattern.finditer(text))
-    blocks: list[tuple[int, str]] = []
-    for i, match in enumerate(matches):
-        week_number = int(match.group(1))
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        blocks.append((week_number, text[start:end].strip()))
-    return blocks
+def _extract_json_payload(text: str) -> str:
+    """Extract a JSON object payload from model text response."""
+    stripped = text.strip()
+    code_fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", stripped, re.DOTALL)
+    if code_fence:
+        return code_fence.group(1).strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return stripped[start:end + 1].strip()
+    return stripped
 
 
-def _extract_discipline(block_text: str) -> str | None:
-    match = re.search(
-        r"(?im)^\*\*Discipline:\*\*\s*(Business|Systems Engineer|Developer)\s*$",
-        block_text,
-    )
-    return match.group(1) if match else None
+def _parse_events_json(text: str) -> tuple[list[dict], list[str], str]:
+    """Parse generated JSON and return events, errors, and normalized JSON text."""
+    payload_text = _extract_json_payload(text)
+    errors: list[str] = []
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        return [], [f"Output is not valid JSON: {exc}"], payload_text
+
+    if not isinstance(payload, dict):
+        return [], ["Top-level JSON must be an object."], payload_text
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return [], ["Top-level key 'events' must be an array."], payload_text
+    normalized = json.dumps(payload, ensure_ascii=True, indent=2)
+    return events, errors, normalized
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _collect_prior_artifacts(previous_events: str | None) -> set[str]:
+    if not previous_events:
+        return set()
+    events, _, _ = _parse_events_json(previous_events)
+    artifacts: set[str] = set()
+    for event in events:
+        if isinstance(event, dict):
+            for item in event.get("deliverables", []):
+                if isinstance(item, dict):
+                    artifact = item.get("artifact")
+                    if isinstance(artifact, str) and artifact.strip():
+                        artifacts.add(_normalize_text(artifact))
+    return artifacts
 
 
 def _validate_output_shape(
-    text: str,
+    events: list[dict],
     mode: str,
     discipline: str | None,
     num_weeks: int,
     start_week: int,
+    deliverables_per_event: int,
+    previous_artifacts: set[str],
 ) -> tuple[bool, list[str]]:
     """
-    Validate generated output for week continuity and discipline consistency.
+    Validate generated JSON for schema, continuity, discipline, and novelty.
     """
     errors: list[str] = []
-    blocks = _split_week_blocks(text)
-    if not blocks:
-        return False, ["No valid '## Week N' sections were found."]
-
     expected_weeks = list(range(start_week, start_week + num_weeks))
+    allowed_disciplines = set(DISCIPLINE_ORDER)
+    seen_artifacts: set[str] = set()
+
+    if not events:
+        return False, ["No events were returned in 'events'."]
+
+    event_records: list[tuple[int, str, dict]] = []
+    for idx, event in enumerate(events, start=1):
+        if not isinstance(event, dict):
+            errors.append(f"Event {idx} must be an object.")
+            continue
+        week = event.get("week")
+        title = event.get("title")
+        event_discipline = event.get("discipline")
+        scenario = event.get("scenario")
+        deliverables = event.get("deliverables")
+        if not isinstance(week, int):
+            errors.append(f"Event {idx} has non-integer 'week'.")
+            continue
+        if not isinstance(title, str) or not title.strip():
+            errors.append(f"Event {idx} is missing non-empty 'title'.")
+        if event_discipline not in allowed_disciplines:
+            errors.append(
+                f"Event {idx} has invalid discipline '{event_discipline}'."
+            )
+        if not isinstance(scenario, str) or not scenario.strip():
+            errors.append(f"Event {idx} is missing non-empty 'scenario'.")
+        if not isinstance(deliverables, list):
+            errors.append(f"Event {idx} 'deliverables' must be an array.")
+            continue
+        if len(deliverables) != deliverables_per_event:
+            errors.append(
+                f"Event {idx} expected {deliverables_per_event} deliverable(s), "
+                f"got {len(deliverables)}."
+            )
+        event_records.append((week, str(event_discipline), event))
+
+        for deliverable_idx, deliverable in enumerate(deliverables, start=1):
+            if not isinstance(deliverable, dict):
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} must be an object."
+                )
+                continue
+            for field in [
+                "artifact",
+                "purpose",
+                "required_contents",
+                "audience",
+                "reference",
+            ]:
+                value = deliverable.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"Event {idx} deliverable {deliverable_idx} has invalid "
+                        f"'{field}'."
+                    )
+
+            artifact_raw = deliverable.get("artifact", "")
+            artifact = _normalize_text(artifact_raw) if isinstance(artifact_raw, str) else ""
+            if artifact:
+                if artifact in seen_artifacts:
+                    errors.append(
+                        f"Event {idx} deliverable {deliverable_idx} repeats artifact "
+                        f"'{artifact_raw}'."
+                    )
+                if artifact in previous_artifacts:
+                    errors.append(
+                        f"Event {idx} deliverable {deliverable_idx} reuses prior "
+                        f"artifact '{artifact_raw}'."
+                    )
+                seen_artifacts.add(artifact)
+
+            reference = deliverable.get("reference", "")
+            if isinstance(reference, str):
+                has_defense = any(
+                    token.lower() in reference.lower()
+                    for token in REFERENCE_DEFENSE_KEYWORDS
+                )
+                has_contract = any(
+                    token.lower() in reference.lower()
+                    for token in REFERENCE_CONTRACT_KEYWORDS
+                )
+                if not has_defense or not has_contract:
+                    errors.append(
+                        f"Event {idx} deliverable {deliverable_idx} reference must "
+                        "include both a defense doc keyword and a contract-style "
+                        "artifact keyword."
+                    )
 
     if mode in {"single", "set"}:
-        if len(blocks) != num_weeks:
+        if len(event_records) != num_weeks:
             errors.append(
-                f"Expected {num_weeks} week section(s), found {len(blocks)}."
+                f"Expected {num_weeks} event(s), found {len(event_records)}."
             )
-
-        got_weeks = [week for week, _ in blocks]
+        got_weeks = [week for week, _, _ in event_records]
         if got_weeks != expected_weeks:
             errors.append(
                 f"Week numbering mismatch. Expected {expected_weeks}, got {got_weeks}."
             )
-
         if discipline:
-            for idx, (_, block) in enumerate(blocks, start=1):
-                block_discipline = _extract_discipline(block)
-                if block_discipline != discipline:
+            for idx, (_, record_discipline, _) in enumerate(event_records, start=1):
+                if record_discipline != discipline:
                     errors.append(
-                        f"Week block {idx} has discipline '{block_discipline}', "
+                        f"Event {idx} has discipline '{record_discipline}', "
                         f"expected '{discipline}'."
                     )
-
     else:
         expected_count = num_weeks * 3
-        if len(blocks) != expected_count:
+        if len(event_records) != expected_count:
             errors.append(
-                f"Expected {expected_count} sections for all-disciplines mode, "
-                f"found {len(blocks)}."
+                f"Expected {expected_count} events for all-disciplines mode, "
+                f"found {len(event_records)}."
             )
-
         week_counts: dict[int, int] = {}
         week_to_disciplines: dict[int, set[str]] = {}
         week_discipline_order: dict[int, list[str]] = {}
-        for week, block in blocks:
+        for week, disc, _ in event_records:
             week_counts[week] = week_counts.get(week, 0) + 1
-            disc = _extract_discipline(block)
-            if disc:
-                week_to_disciplines.setdefault(week, set()).add(disc)
-                week_discipline_order.setdefault(week, []).append(disc)
+            week_to_disciplines.setdefault(week, set()).add(disc)
+            week_discipline_order.setdefault(week, []).append(disc)
 
         for week in expected_weeks:
             if week_counts.get(week, 0) != 3:
@@ -333,9 +459,9 @@ def _build_repair_prompt(
     """Prompt used to repair invalid output format/content boundaries."""
     joined_errors = "\n".join(f"- {error}" for error in errors)
     return (
-        "Your previous answer violated formatting or consistency constraints.\n\n"
+        "Your previous answer violated JSON schema or consistency constraints.\n\n"
         "You MUST rewrite the full answer from scratch using the original task.\n"
-        "Do not explain. Do not apologize. Output only corrected events.\n\n"
+        "Do not explain. Do not apologize. Output only corrected JSON.\n\n"
         "--- ORIGINAL TASK ---\n"
         f"{original_prompt}\n"
         "--- END ORIGINAL TASK ---\n\n"
@@ -345,7 +471,7 @@ def _build_repair_prompt(
         "--- INVALID OUTPUT (FOR REFERENCE) ---\n"
         f"{invalid_output}\n"
         "--- END INVALID OUTPUT ---\n\n"
-        "Now provide only the corrected markdown events."
+        "Now provide only the corrected JSON object."
     )
 
 
@@ -361,7 +487,8 @@ def _add_previous_events_context(prompt: str, previous_events: str | None) -> st
             "The following events have already occurred on this project. "
             "Your new event(s) MUST build on, reference, or be a consequence "
             "of what has already happened. Do not repeat previous events. "
-            "Advance the project timeline forward.\n\n"
+            "Advance the project timeline forward. Avoid reusing prior deliverable "
+            "artifact names.\n\n"
             f"{previous_events}\n"
             "--- END PREVIOUS EVENTS ---\n"
         )
@@ -416,13 +543,12 @@ def _build_single_event_prompt(
         f"for an intern in the '{discipline}' discipline. ONLY '{discipline}' "
         f"— do not generate events for any other discipline.\n\n"
         f"OUTPUT EXACTLY ONE EVENT. Do NOT generate a second event. "
-        f"Do NOT generate Week 2 or any continuation. ONE event only. "
-        f"Stop after the first horizontal rule (---).\n\n"
+        f"Do NOT generate Week 2 or any continuation. ONE event only.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for {discipline}:\n{guidance}\n\n"
         f"Required deliverable count for this event: {deliverables_per_event}. "
-        f"Produce exactly {deliverables_per_event} bullet item(s) under "
-        f"'**Required Deliverables:**'.\n\n"
+        f"Produce exactly {deliverables_per_event} objects in the "
+        f"'deliverables' array.\n\n"
         f"{EVENT_FORMAT}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
@@ -435,7 +561,7 @@ def _build_single_event_prompt(
         )
     prompt += (
         PROMPT_CLOSER +
-        " Generate ONLY ONE event. Stop after the --- separator."
+        " Generate ONLY ONE event in the JSON events array."
     )
     return prompt
 
@@ -462,8 +588,8 @@ def _build_set_prompt(
         f"It should be a consequence of, or build on, earlier events. "
         f"The project is alive — things happen because of what came before.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
-        f"Each event must include exactly {deliverables_per_event} bullet "
-        f"item(s) under '**Required Deliverables:**'.\n\n"
+        f"Each event must include exactly {deliverables_per_event} objects in "
+        f"'deliverables'.\n\n"
         f"{EVENT_FORMAT}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
@@ -476,7 +602,7 @@ def _build_set_prompt(
         )
     prompt += (
         PROMPT_CLOSER +
-        " Generate ONLY ONE event for this week. Stop after the --- separator."
+        " Generate ONLY ONE event for this week."
     )
     return prompt
 
@@ -505,15 +631,13 @@ def _build_all_disciplines_prompt(
         f"in the real world. The Systems Engineer must react to that discovery "
         f"at the architecture/model level. The Developer must build or change "
         f"something because of the SE's response.\n\n"
-        f"IMPORTANT — Organize the output BY WEEK, not by discipline:\n"
-        f"## Week {week_number}\n"
-        f"Show the Business event, then Systems Engineer event, then Developer "
-        f"event for that week.\n\n"
+        f"IMPORTANT — Organize the output by week values in JSON.\n"
+        f"Use week={week_number} for every event this call.\n\n"
         f"STRICT ORDER: Within each week, the event order must be exactly: "
         f"Business, then Systems Engineer, then Developer.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
-        f"Each event must include exactly {deliverables_per_event} bullet "
-        f"item(s) under '**Required Deliverables:**'.\n\n"
+        f"Each event must include exactly {deliverables_per_event} objects in "
+        f"'deliverables'.\n\n"
         f"{EVENT_FORMAT}"
     )
     if cross_reference:
@@ -634,6 +758,7 @@ def generate_events(
     final_output = ""
     max_attempts = 3
     current_prompt = user_prompt
+    previous_artifacts = _collect_prior_artifacts(previous_events)
 
     for attempt in range(1, max_attempts + 1):
         messages = [
@@ -647,21 +772,25 @@ def generate_events(
             if token:
                 candidate += token
 
+        events, parse_errors, normalized_json = _parse_events_json(candidate)
         is_valid, errors = _validate_output_shape(
-            text=candidate,
+            events=events,
             mode=mode,
             discipline=discipline,
             num_weeks=num_weeks,
             start_week=start_week,
+            deliverables_per_event=deliverables_per_event,
+            previous_artifacts=previous_artifacts,
         )
-        final_output = candidate
+        errors = parse_errors + errors
+        final_output = normalized_json if not parse_errors else candidate
         if is_valid:
             break
         if attempt < max_attempts:
             current_prompt = _build_repair_prompt(user_prompt, candidate, errors)
         else:
             LAST_GENERATION_WARNING = (
-                "Output had formatting consistency issues after retries. "
+                "Output had JSON consistency issues after retries. "
                 "Showing best attempt."
             )
 

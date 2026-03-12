@@ -3,6 +3,8 @@ Intern Simulator — Streamlit application.
 Generates realistic weekly events for interns using local Ollama models.
 """
 
+import json
+
 import streamlit as st
 from generation_api import request_generate_week, start_local_api_server
 from generator import (
@@ -23,6 +25,7 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 DEFAULTS = {
     "event_history": [],       # list of generated markdown strings
+    "event_history_json": [],  # list of generated JSON payload strings
     "week_counter": 0,         # tracks how many weeks have been generated
     "last_mode": None,         # remember mode for continue button
     "last_discipline": None,   # remember discipline for continue button
@@ -150,6 +153,7 @@ with st.sidebar:
         )
         if st.button("Reset Timeline", use_container_width=True):
             st.session_state.event_history = []
+            st.session_state.event_history_json = []
             st.session_state.week_counter = 0
             st.session_state.last_mode = None
             st.session_state.last_discipline = None
@@ -179,24 +183,90 @@ def _build_codebase_context(uploaded_file_list) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def _events_to_markdown(events: list[dict]) -> str:
+    """Render structured event JSON to markdown for display."""
+    blocks: list[str] = []
+    for event in events:
+        week = event.get("week", "?")
+        title = event.get("title", "Untitled Event")
+        discipline = event.get("discipline", "Unknown")
+        scenario = (event.get("scenario") or "").strip()
+        deliverables = event.get("deliverables") or []
+
+        lines = [
+            f"## Week {week}: {title}",
+            "",
+            f"**Discipline:** {discipline}",
+            "",
+            "**Scenario:**",
+            scenario,
+            "",
+            "**Required Deliverables:**",
+        ]
+        for deliverable in deliverables:
+            lines.extend(
+                [
+                    "",
+                    f"- **Artifact:** {deliverable.get('artifact', '')}",
+                    f"  - **Purpose:** {deliverable.get('purpose', '')}",
+                    "  - **Required Contents:** "
+                    f"{deliverable.get('required_contents', '')}",
+                    f"  - **Audience:** {deliverable.get('audience', '')}",
+                    f"  - **Reference:** {deliverable.get('reference', '')}",
+                ]
+            )
+        lines.extend(["", "---"])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _history_events_payload(history_json: list[str]) -> str | None:
+    """Merge prior generation JSON payloads into one previous-events payload."""
+    merged_events: list[dict] = []
+    for chunk in history_json:
+        try:
+            parsed = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        events = parsed.get("events")
+        if isinstance(events, list):
+            merged_events.extend(events)
+    if not merged_events:
+        return None
+    return json.dumps({"events": merged_events}, ensure_ascii=True)
+
+
 def run_generation(
     container,
     mode_key: str,
     disc: str | None,
     weeks: int,
     start_week: int,
-    previous_events: str | None,
+    previous_events_json: str | None,
     feedback_text: str | None = None,
 ):
-    """Generate one week per API call and stream cumulative markdown."""
+    """Generate one week per API call and stream cumulative markdown/JSON."""
     warning_area = container.empty()
     progress_area = container.empty()
     output_area = container.empty()
     warnings: list[str] = []
     week_chunks: list[str] = []
+    rolling_events: list[dict] = []
     generated_weeks = 0
     codebase_context = _build_codebase_context(uploaded_files)
-    current_previous = previous_events
+    if previous_events_json:
+        try:
+            parsed = json.loads(previous_events_json)
+            prior_events = parsed.get("events")
+            if isinstance(prior_events, list):
+                rolling_events.extend(prior_events)
+        except json.JSONDecodeError:
+            pass
+    current_previous = (
+        json.dumps({"events": rolling_events}, ensure_ascii=True)
+        if rolling_events
+        else None
+    )
 
     try:
         for offset in range(weeks):
@@ -219,18 +289,19 @@ def run_generation(
                     "codebase_context": codebase_context,
                 }
             )
-            week_text = (response.get("content") or "").strip()
-            if not week_text:
+            week_events = response.get("events")
+            if not isinstance(week_events, list) or not week_events:
                 raise RuntimeError(
-                    f"API returned empty content for week {current_week}."
+                    f"API returned invalid events for week {current_week}."
                 )
-            week_chunks.append(week_text)
+            week_chunks.append(_events_to_markdown(week_events))
+            rolling_events.extend(week_events)
             generated_weeks += 1
             warning_text = response.get("warning")
             if warning_text:
                 warnings.append(f"Week {current_week}: {warning_text}")
             current_previous = (
-                f"{current_previous}\n\n{week_text}" if current_previous else week_text
+                json.dumps({"events": rolling_events}, ensure_ascii=True)
             )
             output_area.markdown("\n\n".join(week_chunks))
     except Exception as e:
@@ -240,7 +311,7 @@ def run_generation(
             "available. You can pull a model with: ollama pull <model-name>"
         )
         if not week_chunks:
-            return None, 0
+            return None, None, 0
     finally:
         progress_area.empty()
 
@@ -248,7 +319,12 @@ def run_generation(
         warning_area.warning("\n".join(warnings))
 
     full_response = "\n\n".join(week_chunks)
-    return (full_response if full_response else None), generated_weeks
+    full_json = (
+        json.dumps({"events": rolling_events}, ensure_ascii=True, indent=2)
+        if rolling_events
+        else None
+    )
+    return (full_response if full_response else None), full_json, generated_weeks
 
 
 # ---------------------------------------------------------------------------
@@ -296,55 +372,61 @@ if st.session_state.event_history:
         if action == "regenerate":
             # Remove the last generation and regenerate it
             st.session_state.event_history.pop()
+            if st.session_state.event_history_json:
+                st.session_state.event_history_json.pop()
             st.session_state.week_counter -= st.session_state.last_weeks
             start_week = st.session_state.week_counter + 1
             weeks = st.session_state.last_weeks
             previous = (
-                "\n\n".join(st.session_state.event_history)
-                if st.session_state.event_history
-                else None
+                _history_events_payload(st.session_state.event_history_json)
             )
 
             with streaming_container:
                 st.markdown("**Regenerating with feedback...**")
-                result, generated = run_generation(
+                result, result_json, generated = run_generation(
                     streaming_container, m, d, weeks, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
+                if result_json:
+                    st.session_state.event_history_json.append(result_json)
                 st.session_state.week_counter += generated
                 st.session_state.last_weeks = generated
                 st.session_state.last_mode = m
 
         elif action == "continue_1":
             start_week = st.session_state.week_counter + 1
-            previous = "\n\n".join(st.session_state.event_history)
+            previous = _history_events_payload(st.session_state.event_history_json)
 
             with streaming_container:
                 st.markdown("**Generating next week...**")
-                result, generated = run_generation(
+                result, result_json, generated = run_generation(
                     streaming_container, m, d, 1, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
+                if result_json:
+                    st.session_state.event_history_json.append(result_json)
                 st.session_state.week_counter += generated
                 st.session_state.last_weeks = generated
 
         elif action == "continue_n":
             weeks = st.session_state.pending_weeks
             start_week = st.session_state.week_counter + 1
-            previous = "\n\n".join(st.session_state.event_history)
+            previous = _history_events_payload(st.session_state.event_history_json)
             # Upgrade mode for multi-week if needed
             if m == "single":
                 m = "set"
 
             with streaming_container:
                 st.markdown(f"**Generating next {weeks} weeks...**")
-                result, generated = run_generation(
+                result, result_json, generated = run_generation(
                     streaming_container, m, d, weeks, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
+                if result_json:
+                    st.session_state.event_history_json.append(result_json)
                 st.session_state.week_counter += generated
                 st.session_state.last_weeks = generated
                 st.session_state.last_mode = m
@@ -364,6 +446,13 @@ if st.session_state.event_history:
         data=all_events,
         file_name="intern_events.md",
         mime="text/markdown",
+    )
+    all_events_json = _history_events_payload(st.session_state.event_history_json)
+    st.download_button(
+        label="Download Full Timeline JSON",
+        data=all_events_json or json.dumps({"events": []}, ensure_ascii=True, indent=2),
+        file_name="intern_events.json",
+        mime="application/json",
     )
 
     st.divider()
@@ -447,11 +536,13 @@ else:
             mode_key = "all"
 
         container = st.container()
-        result, generated = run_generation(
+        result, result_json, generated = run_generation(
             container, mode_key, discipline, num_weeks, 1, None
         )
         if result:
             st.session_state.event_history.append(result)
+            if result_json:
+                st.session_state.event_history_json.append(result_json)
             st.session_state.week_counter += generated
             st.session_state.last_mode = mode_key
             st.session_state.last_discipline = discipline
