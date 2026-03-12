@@ -255,7 +255,10 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
         "- Do not tell the intern what to do — describe what happened.\n"
         "- Events should be realistic and appropriately scoped for an intern.\n"
         "- Use specific numbers only when they are clearly estimates or scenario observations.\n"
+        "- Treat all numeric values as simulated estimates unless explicitly stated otherwise.\n"
         "- Later events must build on consequences of earlier ones.\n"
+        "- Every event must clearly reference the provided project context.\n"
+        "- Do not drift into maritime/naval scenarios unless the project is maritime.\n"
         "- Do not use emojis anywhere.\n"
         "- Use plain, professional language.\n"
         "- NEVER include preamble, questions, or commentary.\n"
@@ -291,7 +294,13 @@ def _parse_events_json(text: str) -> tuple[list[dict], list[str], str]:
     try:
         payload = json.loads(payload_text)
     except json.JSONDecodeError as exc:
-        return [], [f"Output is not valid JSON: {exc}"], payload_text
+        # Recover common LLM JSON issue: trailing commas before '}' or ']'.
+        cleaned_payload = re.sub(r",\s*([}\]])", r"\1", payload_text)
+        try:
+            payload = json.loads(cleaned_payload)
+            payload_text = cleaned_payload
+        except json.JSONDecodeError:
+            return [], [f"Output is not valid JSON: {exc}"], payload_text
 
     if not isinstance(payload, dict):
         return [], ["Top-level JSON must be an object."], payload_text
@@ -329,6 +338,150 @@ def _format_contains_defense_reference(value: str) -> bool:
     return False
 
 
+def _extract_project_anchors(project_description: str) -> list[str]:
+    """Extract distinctive terms from the provided project description."""
+    anchors: list[str] = []
+    title_match = re.search(r"(?im)^project\s+title:\s*(.+)$", project_description)
+    if title_match:
+        anchors.append(title_match.group(1).strip())
+
+    anchors.extend(re.findall(r"\(([A-Z][A-Z0-9]{2,})\)", project_description))
+    anchors.extend(
+        re.findall(
+            r"\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){0,3})\b",
+            project_description,
+        )
+    )
+
+    generic = {
+        "Project", "Description", "System", "Systems", "Development", "Research",
+        "Application", "Platform", "Data", "Database", "Frontend", "Backend",
+        "Infrastructure", "Docker", "Python", "React", "FastAPI", "Requirements",
+    }
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in anchors:
+        cleaned = re.sub(r"\s+", " ", item).strip()
+        if not cleaned or cleaned in generic:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cleaned)
+    return unique[:12]
+
+
+def _is_maritime_project(project_description: str) -> bool:
+    maritime_terms = [
+        "maritime", "vessel", "ship", "port", "ais", "strait",
+        "naval", "cargo", "coast", "ocean", "sea",
+    ]
+    text = project_description.lower()
+    return any(
+        re.search(r"\b" + re.escape(term) + r"\b", text)
+        for term in maritime_terms
+    )
+
+
+def _sanitize_non_maritime_language(events: list[dict]) -> list[dict]:
+    """Replace maritime-specific wording for non-maritime projects."""
+    replacements = [
+        (r"\bmaritime\b", "urban mobility"),
+        (r"\bvessels?\b", "vehicles"),
+        (r"\bships?\b", "vehicles"),
+        (r"\bshipping\b", "traffic"),
+        (r"\bports?\b", "transport hubs"),
+        (r"\bcargo\b", "payload"),
+        (r"\bfreight\b", "transport load"),
+        (r"\bstrait\b", "corridor"),
+        (r"\bnaval\b", "transport"),
+        (r"\banchorage\b", "staging area"),
+    ]
+    sanitized: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_copy = dict(event)
+        title = event_copy.get("title")
+        if isinstance(title, str):
+            updated_title = title
+            for pattern, repl in replacements:
+                updated_title = re.sub(pattern, repl, updated_title, flags=re.IGNORECASE)
+            event_copy["title"] = updated_title
+        scenario = event_copy.get("scenario")
+        if isinstance(scenario, str):
+            updated = scenario
+            for pattern, repl in replacements:
+                updated = re.sub(pattern, repl, updated, flags=re.IGNORECASE)
+            event_copy["scenario"] = updated
+        deliverables = event_copy.get("deliverables")
+        if isinstance(deliverables, list):
+            clean_deliverables: list[dict] = []
+            for d in deliverables:
+                if not isinstance(d, dict):
+                    continue
+                d_copy = dict(d)
+                for key in ["artifact", "purpose", "audience"]:
+                    value = d_copy.get(key)
+                    if isinstance(value, str):
+                        updated = value
+                        for pattern, repl in replacements:
+                            updated = re.sub(pattern, repl, updated, flags=re.IGNORECASE)
+                        d_copy[key] = updated
+                clean_deliverables.append(d_copy)
+            event_copy["deliverables"] = clean_deliverables
+        sanitized.append(event_copy)
+    return sanitized
+
+
+def _serialize_events(events: list[dict]) -> str:
+    """Serialize events payload with stable formatting."""
+    return json.dumps({"events": events}, ensure_ascii=True, indent=2)
+
+
+def _coerce_events_for_mode(
+    events: list[dict],
+    mode: str,
+    discipline: str | None,
+    start_event: int,
+) -> list[dict]:
+    """
+    Coerce near-valid model output into expected single-step event shape.
+    This reduces brittle failures on continued generations.
+    """
+    coerced: list[dict] = []
+    for event in events:
+        if isinstance(event, dict):
+            normalized = dict(event)
+            normalized["event_number"] = start_event
+            coerced.append(normalized)
+
+    if mode == "all":
+        selected: list[dict] = []
+        for expected_disc in DISCIPLINE_ORDER:
+            match = next(
+                (
+                    item for item in coerced
+                    if str(item.get("discipline", "")).strip() == expected_disc
+                ),
+                None,
+            )
+            if match is not None:
+                selected.append(match)
+        return selected
+
+    if mode in {"single", "set"}:
+        if not coerced:
+            return coerced
+        first = coerced[0]
+        if discipline:
+            first["discipline"] = discipline
+        return [first]
+
+    return coerced
+
+
 def _artifact_similarity(left: str, right: str) -> float:
     """Approximate similarity between artifact names."""
     left_norm = _normalize_text(left)
@@ -356,6 +509,8 @@ def _validate_output_shape(
     start_event: int,
     deliverables_per_event: int,
     previous_artifacts: set[str],
+    project_anchors: list[str] | None = None,
+    allow_maritime_context: bool = True,
 ) -> tuple[bool, list[str]]:
     """
     Validate generated JSON for schema, continuity, discipline, and novelty.
@@ -365,6 +520,7 @@ def _validate_output_shape(
     allowed_disciplines = set(DISCIPLINE_ORDER)
     seen_artifacts: set[str] = set()
     seen_artifact_labels: list[tuple[int, int, str]] = []
+    anchor_pool = project_anchors or []
 
     if not events:
         return False, ["No events were returned in 'events'."]
@@ -390,6 +546,38 @@ def _validate_output_shape(
             )
         if not isinstance(scenario, str) or not scenario.strip():
             errors.append(f"Event {idx} is missing non-empty 'scenario'.")
+        elif anchor_pool:
+            combined_text = scenario
+            for item in event.get("deliverables", []):
+                if isinstance(item, dict):
+                    combined_text += " " + str(item.get("artifact", ""))
+                    combined_text += " " + str(item.get("purpose", ""))
+            combined_norm = _normalize_text(combined_text)
+            has_anchor = any(
+                _normalize_text(anchor) in combined_norm
+                for anchor in anchor_pool
+                if len(_normalize_text(anchor)) >= 4
+            )
+            if not has_anchor:
+                errors.append(
+                    f"Event {idx} is not grounded in project-specific context."
+                )
+        if not allow_maritime_context:
+            combined_for_domain = (
+                str(title or "") + " " + str(scenario or "")
+            ).lower()
+            maritime_markers = [
+                "maritime", "vessel", "ship", "port", "strait",
+                "naval", "cargo", "coast guard", "anchorage",
+            ]
+            if any(
+                re.search(r"\b" + re.escape(marker) + r"\b", combined_for_domain)
+                for marker in maritime_markers
+            ):
+                errors.append(
+                    f"Event {idx} drifts into maritime-specific context that is "
+                    "not present in the project description."
+                )
         if not isinstance(deliverables, list):
             errors.append(f"Event {idx} 'deliverables' must be an array.")
             continue
@@ -638,6 +826,18 @@ def _build_single_event_prompt(
     deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
+    project_anchors = _extract_project_anchors(project_description)
+    non_maritime_guardrail = (
+        "\n\nDOMAIN GUARDRAIL: This project is not maritime-focused. "
+        "Do NOT mention ships, vessels, ports, straits, naval operations, or cargo "
+        "unless those terms are explicitly present in the provided project text."
+        if not _is_maritime_project(project_description)
+        else ""
+    )
+    anchor_instruction = (
+        "\n\nPROJECT-SPECIFIC ANCHORS:\n- " + "\n- ".join(project_anchors)
+        if project_anchors else ""
+    )
     event_label = f"Event {event_number}" if event_number else "an event"
     prompt = (
         f"Generate EXACTLY ONE event — a single event — for {event_label} "
@@ -651,6 +851,10 @@ def _build_single_event_prompt(
         f"Produce exactly {deliverables_per_event} objects in the "
         f"'deliverables' array.\n\n"
         f"{EVENT_FORMAT}"
+        f"{anchor_instruction}\n\n"
+        "Ground this event in the provided project by explicitly using at least "
+        "one project-specific anchor."
+        f"{non_maritime_guardrail}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
     prompt = _add_feedback_context(prompt, feedback)
@@ -677,6 +881,18 @@ def _build_set_prompt(
     deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
+    project_anchors = _extract_project_anchors(project_description)
+    non_maritime_guardrail = (
+        "\n\nDOMAIN GUARDRAIL: This project is not maritime-focused. "
+        "Do NOT mention ships, vessels, ports, straits, naval operations, or cargo "
+        "unless those terms are explicitly present in the provided project text."
+        if not _is_maritime_project(project_description)
+        else ""
+    )
+    anchor_instruction = (
+        "\n\nPROJECT-SPECIFIC ANCHORS:\n- " + "\n- ".join(project_anchors)
+        if project_anchors else ""
+    )
     prompt = (
         f"Generate EXACTLY ONE event for Event {event_number} "
         f"for an intern in the '{discipline}' discipline. "
@@ -692,6 +908,10 @@ def _build_set_prompt(
         f"Each event must include exactly {deliverables_per_event} objects in "
         f"'deliverables'.\n\n"
         f"{EVENT_FORMAT}"
+        f"{anchor_instruction}\n\n"
+        "Ground this event in the provided project by explicitly using at least "
+        "one project-specific anchor."
+        f"{non_maritime_guardrail}"
     )
     prompt = _add_previous_events_context(prompt, previous_events)
     prompt = _add_feedback_context(prompt, feedback)
@@ -720,6 +940,18 @@ def _build_all_disciplines_prompt(
     all_guidance = "\n\n".join(
         f"### {disc}\n{g}" for disc, g in DISCIPLINE_GUIDANCE.items()
     )
+    project_anchors = _extract_project_anchors(project_description)
+    non_maritime_guardrail = (
+        "\n\nDOMAIN GUARDRAIL: This project is not maritime-focused. "
+        "Do NOT mention ships, vessels, ports, straits, naval operations, or cargo "
+        "unless those terms are explicitly present in the provided project text."
+        if not _is_maritime_project(project_description)
+        else ""
+    )
+    anchor_instruction = (
+        "\n\nPROJECT-SPECIFIC ANCHORS:\n- " + "\n- ".join(project_anchors)
+        if project_anchors else ""
+    )
     prompt = (
         f"Generate a coordinated set of events for THREE interns "
         f"working on the same project, one in each discipline: "
@@ -733,13 +965,18 @@ def _build_all_disciplines_prompt(
         f"at the architecture/model level. The Developer must build or change "
         f"something because of the SE's response.\n\n"
         f"IMPORTANT — Organize the output by event_number values in JSON.\n"
-        f"Use event_number={event_number} for every event this call.\n\n"
+        f"Use event_number={event_number} for every event this call.\n"
+        f"All three events MUST have the same event_number ({event_number}).\n\n"
         f"STRICT ORDER: Within each event_number, the event order must be exactly: "
         f"Business, then Systems Engineer, then Developer.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
         f"Each event must include exactly {deliverables_per_event} objects in "
         f"'deliverables'.\n\n"
         f"{EVENT_FORMAT}"
+        f"{anchor_instruction}\n\n"
+        "Ground each event in the provided project by explicitly using at least "
+        "one project-specific anchor per discipline block."
+        f"{non_maritime_guardrail}"
     )
     if cross_reference:
         prompt = _add_cross_reference_instruction(prompt)
@@ -861,6 +1098,8 @@ def generate_events(
     current_prompt = user_prompt
     client = _get_client()
     previous_artifacts = _collect_prior_artifacts(previous_events)
+    project_anchors = _extract_project_anchors(project_description)
+    allow_maritime_context = _is_maritime_project(project_description)
 
     for attempt in range(1, max_attempts + 1):
         messages = [
@@ -878,18 +1117,49 @@ def generate_events(
             if delta and delta.content:
                 candidate += delta.content
 
-        events, parse_errors, normalized_json = _parse_events_json(candidate)
+        events, parse_errors, _normalized_json = _parse_events_json(candidate)
+        validated_events = (
+            _sanitize_non_maritime_language(events)
+            if not allow_maritime_context
+            else events
+        )
         is_valid, errors = _validate_output_shape(
-            events=events,
+            events=validated_events,
             mode=mode,
             discipline=discipline,
             num_events=num_events,
             start_event=start_event,
             deliverables_per_event=deliverables_per_event,
             previous_artifacts=previous_artifacts,
+            project_anchors=project_anchors,
+            allow_maritime_context=allow_maritime_context,
         )
+        if not is_valid and not parse_errors:
+            coerced_events = _coerce_events_for_mode(
+                events=validated_events,
+                mode=mode,
+                discipline=discipline,
+                start_event=start_event,
+            )
+            coerced_valid, coerced_errors = _validate_output_shape(
+                events=coerced_events,
+                mode=mode,
+                discipline=discipline,
+                num_events=num_events,
+                start_event=start_event,
+                deliverables_per_event=deliverables_per_event,
+                previous_artifacts=previous_artifacts,
+                project_anchors=project_anchors,
+                allow_maritime_context=allow_maritime_context,
+            )
+            if coerced_valid:
+                is_valid = True
+                errors = []
+                validated_events = coerced_events
+            else:
+                errors = coerced_errors
         errors = parse_errors + errors
-        final_output = normalized_json if not parse_errors else candidate
+        final_output = _serialize_events(validated_events) if not parse_errors else candidate
         if is_valid:
             break
         if attempt < max_attempts:
@@ -898,6 +1168,13 @@ def generate_events(
             LAST_GENERATION_WARNING = (
                 "Output had JSON consistency issues after retries. "
                 "Showing best attempt."
+            )
+
+    if LAST_GENERATION_WARNING and not allow_maritime_context:
+        fallback_events, fallback_errors, _ = _parse_events_json(final_output)
+        if not fallback_errors:
+            final_output = _serialize_events(
+                _sanitize_non_maritime_language(fallback_events)
             )
 
     for i in range(0, len(final_output), 120):
