@@ -11,7 +11,7 @@ from generator import (
     get_available_models,
 )
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # ---------------------------------------------------------------------------
 # Page config
