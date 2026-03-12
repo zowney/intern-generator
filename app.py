@@ -11,6 +11,8 @@ from generator import (
     get_available_models,
 )
 
+APP_VERSION = "1.0.0"
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -61,6 +63,7 @@ st.markdown(
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Configuration")
+    st.caption(f"Version {APP_VERSION}")
 
     models = get_available_models()
     selected_model = st.selectbox("Ollama Model", options=models, index=0)

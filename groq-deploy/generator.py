@@ -5,6 +5,7 @@ Handles prompt construction and model interaction via the Groq cloud API.
 
 import json
 import re
+from difflib import SequenceMatcher
 
 import streamlit as st
 from groq import Groq
@@ -190,6 +191,9 @@ EVENT_FORMAT = (
     "- Never include tasks, steps, or solution hints.\n"
     "- Scenario must describe what happened, not how to solve it.\n"
     "- Deliverables must be concrete outputs and must vary week-to-week.\n"
+    "- Artifact names must be specific and materially distinct from prior events.\n"
+    "- Avoid reusing generic templates such as repeated risk assessment or briefing titles.\n"
+    "- Favor diverse artifact forms across weeks (for example matrix, annex, register, watchlist, options memo, review package).\n"
     "- Every reference must mention one of: CDRL, DID, CONOPS, ICD, SRD, TEMP, PDR, CDR.\n"
     "- Every reference must also mention one of: briefing, memo, report, analysis.\n"
     "- Use plain, professional language with no emojis."
@@ -311,6 +315,25 @@ def _collect_prior_artifacts(previous_events: str | None) -> set[str]:
     return artifacts
 
 
+def _artifact_similarity(left: str, right: str) -> float:
+    """Approximate similarity between artifact names."""
+    left_norm = _normalize_text(left)
+    right_norm = _normalize_text(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    ratio = SequenceMatcher(None, left_norm, right_norm).ratio()
+    left_tokens = set(left_norm.split())
+    right_tokens = set(right_norm.split())
+    overlap = (
+        len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+        if left_tokens and right_tokens
+        else 0.0
+    )
+    return max(ratio, overlap)
+
+
 def _validate_output_shape(
     events: list[dict],
     mode: str,
@@ -327,6 +350,7 @@ def _validate_output_shape(
     expected_weeks = list(range(start_week, start_week + num_weeks))
     allowed_disciplines = set(DISCIPLINE_ORDER)
     seen_artifacts: set[str] = set()
+    seen_artifact_labels: list[tuple[int, int, str]] = []
 
     if not events:
         return False, ["No events were returned in 'events'."]
@@ -395,7 +419,24 @@ def _validate_output_shape(
                         f"Event {idx} deliverable {deliverable_idx} reuses prior "
                         f"artifact '{artifact_raw}'."
                     )
+                else:
+                    for prior_artifact in previous_artifacts:
+                        if _artifact_similarity(artifact, prior_artifact) >= 0.80:
+                            errors.append(
+                                f"Event {idx} deliverable {deliverable_idx} is too similar "
+                                f"to prior artifact '{prior_artifact}'."
+                            )
+                            break
+                for prev_event_idx, prev_deliverable_idx, prev_label in seen_artifact_labels:
+                    if _artifact_similarity(artifact_raw, prev_label) >= 0.82:
+                        errors.append(
+                            f"Event {idx} deliverable {deliverable_idx} is too similar "
+                            f"to event {prev_event_idx} deliverable {prev_deliverable_idx} "
+                            f"('{artifact_raw}' vs '{prev_label}')."
+                        )
+                        break
                 seen_artifacts.add(artifact)
+                seen_artifact_labels.append((idx, deliverable_idx, artifact_raw))
 
             reference = deliverable.get("reference", "")
             if isinstance(reference, str):
@@ -773,7 +814,7 @@ def generate_events(
 
     system_prompt = _build_system_prompt(mode, discipline)
     final_output = ""
-    max_attempts = 3
+    max_attempts = 4
     current_prompt = user_prompt
     client = _get_client()
     previous_artifacts = _collect_prior_artifacts(previous_events)
