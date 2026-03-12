@@ -130,16 +130,16 @@ LAST_GENERATION_WARNING: str | None = None
 # Output JSON contract
 # ---------------------------------------------------------------------------
 
-REFERENCE_DEFENSE_KEYWORDS = [
-    "CDRL",
-    "DID",
-    "CONOPS",
-    "ICD",
-    "SRD",
-    "TEMP",
-    "PDR",
-    "CDR",
-]
+REFERENCE_DEFENSE_FORMATS = {
+    "CDRL": "Contract Data Requirements List",
+    "DID": "Data Item Description",
+    "CONOPS": "Concept of Operations",
+    "ICD": "Interface Control Document",
+    "SRD": "System Requirements Document",
+    "TEMP": "Test and Evaluation Master Plan",
+    "PDR": "Preliminary Design Review",
+    "CDR": "Critical Design Review",
+}
 
 REFERENCE_CONTRACT_KEYWORDS = [
     "briefing",
@@ -154,7 +154,7 @@ EVENT_FORMAT = (
     "{\n"
     '  "events": [\n'
     "    {\n"
-    '      "week": <integer>,\n'
+    '      "event_number": <integer>,\n'
     '      "title": "<short descriptive title>",\n'
     '      "discipline": "<Business|Systems Engineer|Developer>",\n'
     '      "scenario": "<1-3 paragraph scenario text>",\n'
@@ -162,9 +162,9 @@ EVENT_FORMAT = (
     "        {\n"
     '          "artifact": "<what is submitted>",\n'
     '          "purpose": "<why it is needed>",\n'
-    '          "required_contents": "<specific required sections or data>",\n'
+    '          "required_contents": ["<exactly 5 plain-language bullets describing what to include>"],\n'
     '          "audience": "<intended reviewer/consumer>",\n'
-    '          "reference": "<must include one defense reference and one contract-style artifact>"\n'
+    '          "potential_formats": ["<array of possible output formats, including acronyms and full names>"]\n'
     "        }\n"
     "      ]\n"
     "    }\n"
@@ -173,12 +173,15 @@ EVENT_FORMAT = (
     "Rules:\n"
     "- Never include tasks, steps, or solution hints.\n"
     "- Scenario must describe what happened, not how to solve it.\n"
-    "- Deliverables must be concrete outputs and must vary week-to-week.\n"
+    "- Deliverables must be concrete outputs and must vary event-to-event.\n"
     "- Artifact names must be specific and materially distinct from prior events.\n"
     "- Avoid reusing generic templates such as repeated risk assessment or briefing titles.\n"
-    "- Favor diverse artifact forms across weeks (for example matrix, annex, register, watchlist, options memo, review package).\n"
-    "- Every reference must mention one of: CDRL, DID, CONOPS, ICD, SRD, TEMP, PDR, CDR.\n"
-    "- Every reference must also mention one of: briefing, memo, report, analysis.\n"
+    "- Favor diverse artifact forms across events (for example matrix, annex, register, watchlist, options memo, review package).\n"
+    "- 'required_contents' must be an array of exactly 5 plain-language bullet strings.\n"
+    "- Keep required_contents concise and intern-friendly (short checklist style).\n"
+    "- 'required_contents' must not contain defense-acronym shorthand.\n"
+    "- 'potential_formats' must be an array and should include both acronym and full-name options.\n"
+    "- Every deliverable's potential_formats must include one defense format and one contract-style format.\n"
     "- Use plain, professional language with no emojis."
 )
 
@@ -202,7 +205,7 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
         "Your SOLE job: read the project description provided and immediately "
         "output events in the exact JSON format specified. Start your "
         "response with '{' — nothing before it.\n\n"
-        "You simulate a living, evolving project by generating weekly events — "
+        "You simulate a living, evolving project by generating events in sequence — "
         "things that HAPPEN — that interns must respond to. You are NOT "
         "generating task lists. You are generating realistic scenarios.\n\n"
         "WORLD-BUILDING: You MUST invent specific, concrete, fictional details "
@@ -210,7 +213,9 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
         "names, report titles, personnel names, measurements, and sources. "
         "The events should feel like real intelligence reports or project "
         "dispatches — not vague summaries. The more specific and grounded "
-        "the details, the better the simulation.\n\n"
+        "the details, the better the simulation. Keep details plausible and "
+        "clearly scenario-based; avoid presenting unverified claims as "
+        "confirmed real-world facts.\n\n"
     )
 
     if mode == "all":
@@ -228,16 +233,17 @@ def _build_system_prompt(mode: str, discipline: str | None = None) -> str:
 
     base += (
         "Rules:\n"
-        "- Each event = one week of work.\n"
+        "- Each event = one timeline step of work.\n"
         "- Present the SITUATION with specific, concrete details.\n"
         "- Do not tell the intern what to do — describe what happened.\n"
         "- Events should be realistic and appropriately scoped for an intern.\n"
+        "- Use specific numbers only when they are clearly estimates or scenario observations.\n"
         "- Later events must build on consequences of earlier ones.\n"
         "- Do not use emojis anywhere.\n"
         "- Use plain, professional language.\n"
         "- NEVER include preamble, questions, or commentary.\n"
         "- Output must be valid JSON with a top-level 'events' array.\n"
-        "- Week values must use integer numbering only.\n"
+        "- Event numbers must use integer numbering only.\n"
     )
 
     return base
@@ -298,6 +304,14 @@ def _collect_prior_artifacts(previous_events: str | None) -> set[str]:
     return artifacts
 
 
+def _format_contains_defense_reference(value: str) -> bool:
+    lowered = value.lower()
+    for acronym, full_name in REFERENCE_DEFENSE_FORMATS.items():
+        if acronym.lower() in lowered or full_name.lower() in lowered:
+            return True
+    return False
+
+
 def _artifact_similarity(left: str, right: str) -> float:
     """Approximate similarity between artifact names."""
     left_norm = _normalize_text(left)
@@ -321,8 +335,8 @@ def _validate_output_shape(
     events: list[dict],
     mode: str,
     discipline: str | None,
-    num_weeks: int,
-    start_week: int,
+    num_events: int,
+    start_event: int,
     deliverables_per_event: int,
     previous_artifacts: set[str],
 ) -> tuple[bool, list[str]]:
@@ -330,7 +344,7 @@ def _validate_output_shape(
     Validate generated JSON for schema, continuity, discipline, and novelty.
     """
     errors: list[str] = []
-    expected_weeks = list(range(start_week, start_week + num_weeks))
+    expected_events = list(range(start_event, start_event + num_events))
     allowed_disciplines = set(DISCIPLINE_ORDER)
     seen_artifacts: set[str] = set()
     seen_artifact_labels: list[tuple[int, int, str]] = []
@@ -343,13 +357,13 @@ def _validate_output_shape(
         if not isinstance(event, dict):
             errors.append(f"Event {idx} must be an object.")
             continue
-        week = event.get("week")
+        event_number = event.get("event_number")
         title = event.get("title")
         event_discipline = event.get("discipline")
         scenario = event.get("scenario")
         deliverables = event.get("deliverables")
-        if not isinstance(week, int):
-            errors.append(f"Event {idx} has non-integer 'week'.")
+        if not isinstance(event_number, int):
+            errors.append(f"Event {idx} has non-integer 'event_number'.")
             continue
         if not isinstance(title, str) or not title.strip():
             errors.append(f"Event {idx} is missing non-empty 'title'.")
@@ -367,7 +381,7 @@ def _validate_output_shape(
                 f"Event {idx} expected {deliverables_per_event} deliverable(s), "
                 f"got {len(deliverables)}."
             )
-        event_records.append((week, str(event_discipline), event))
+        event_records.append((event_number, str(event_discipline), event))
 
         for deliverable_idx, deliverable in enumerate(deliverables, start=1):
             if not isinstance(deliverable, dict):
@@ -378,9 +392,7 @@ def _validate_output_shape(
             for field in [
                 "artifact",
                 "purpose",
-                "required_contents",
                 "audience",
-                "reference",
             ]:
                 value = deliverable.get(field)
                 if not isinstance(value, str) or not value.strip():
@@ -421,32 +433,63 @@ def _validate_output_shape(
                 seen_artifacts.add(artifact)
                 seen_artifact_labels.append((idx, deliverable_idx, artifact_raw))
 
-            reference = deliverable.get("reference", "")
-            if isinstance(reference, str):
-                has_defense = any(
-                    token.lower() in reference.lower()
-                    for token in REFERENCE_DEFENSE_KEYWORDS
+            required_contents = deliverable.get("required_contents")
+            if not isinstance(required_contents, list) or len(required_contents) != 5:
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} required_contents "
+                    "must be an array of exactly 5 bullet strings."
                 )
-                has_contract = any(
-                    token.lower() in reference.lower()
-                    for token in REFERENCE_CONTRACT_KEYWORDS
+            elif not all(isinstance(item, str) and item.strip() for item in required_contents):
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} required_contents "
+                    "must contain only non-empty strings."
                 )
-                if not has_defense or not has_contract:
-                    errors.append(
-                        f"Event {idx} deliverable {deliverable_idx} reference must "
-                        "include both a defense doc keyword and a contract-style "
-                        "artifact keyword."
-                    )
+            else:
+                for bullet in required_contents:
+                    for acronym in REFERENCE_DEFENSE_FORMATS:
+                        if acronym.lower() in bullet.lower():
+                            errors.append(
+                                f"Event {idx} deliverable {deliverable_idx} "
+                                "required_contents should use plain language and avoid "
+                                f"acronym '{acronym}'."
+                            )
+                            break
+
+            potential_formats = deliverable.get("potential_formats")
+            if not isinstance(potential_formats, list) or not potential_formats:
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} potential_formats "
+                    "must be a non-empty array."
+                )
+                continue
+            if not all(isinstance(item, str) and item.strip() for item in potential_formats):
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} potential_formats "
+                    "must contain only non-empty strings."
+                )
+                continue
+            joined_formats = " ".join(potential_formats)
+            has_defense = _format_contains_defense_reference(joined_formats)
+            has_contract = any(
+                token.lower() in joined_formats.lower()
+                for token in REFERENCE_CONTRACT_KEYWORDS
+            )
+            if not has_defense or not has_contract:
+                errors.append(
+                    f"Event {idx} deliverable {deliverable_idx} potential_formats "
+                    "must include both a defense format (acronym or full name) "
+                    "and a contract-style format."
+                )
 
     if mode in {"single", "set"}:
-        if len(event_records) != num_weeks:
+        if len(event_records) != num_events:
             errors.append(
-                f"Expected {num_weeks} event(s), found {len(event_records)}."
+                f"Expected {num_events} event(s), found {len(event_records)}."
             )
-        got_weeks = [week for week, _, _ in event_records]
-        if got_weeks != expected_weeks:
+        got_events = [event_number for event_number, _, _ in event_records]
+        if got_events != expected_events:
             errors.append(
-                f"Week numbering mismatch. Expected {expected_weeks}, got {got_weeks}."
+                f"Event numbering mismatch. Expected {expected_events}, got {got_events}."
             )
         if discipline:
             for idx, (_, record_discipline, _) in enumerate(event_records, start=1):
@@ -456,36 +499,36 @@ def _validate_output_shape(
                         f"expected '{discipline}'."
                     )
     else:
-        expected_count = num_weeks * 3
+        expected_count = num_events * 3
         if len(event_records) != expected_count:
             errors.append(
                 f"Expected {expected_count} events for all-disciplines mode, "
                 f"found {len(event_records)}."
             )
-        week_counts: dict[int, int] = {}
-        week_to_disciplines: dict[int, set[str]] = {}
-        week_discipline_order: dict[int, list[str]] = {}
-        for week, disc, _ in event_records:
-            week_counts[week] = week_counts.get(week, 0) + 1
-            week_to_disciplines.setdefault(week, set()).add(disc)
-            week_discipline_order.setdefault(week, []).append(disc)
+        event_counts: dict[int, int] = {}
+        event_to_disciplines: dict[int, set[str]] = {}
+        event_discipline_order: dict[int, list[str]] = {}
+        for event_number, disc, _ in event_records:
+            event_counts[event_number] = event_counts.get(event_number, 0) + 1
+            event_to_disciplines.setdefault(event_number, set()).add(disc)
+            event_discipline_order.setdefault(event_number, []).append(disc)
 
-        for week in expected_weeks:
-            if week_counts.get(week, 0) != 3:
+        for event_number in expected_events:
+            if event_counts.get(event_number, 0) != 3:
                 errors.append(
-                    f"Week {week} should appear 3 times, found "
-                    f"{week_counts.get(week, 0)}."
+                    f"Event {event_number} should appear 3 times, found "
+                    f"{event_counts.get(event_number, 0)}."
                 )
-            found = week_to_disciplines.get(week, set())
+            found = event_to_disciplines.get(event_number, set())
             if found != set(DISCIPLINE_ORDER):
                 errors.append(
-                    f"Week {week} discipline set mismatch. "
+                    f"Event {event_number} discipline set mismatch. "
                     f"Expected {DISCIPLINE_ORDER}, got {sorted(found)}."
                 )
-            order = week_discipline_order.get(week, [])
+            order = event_discipline_order.get(event_number, [])
             if order != DISCIPLINE_ORDER:
                 errors.append(
-                    f"Week {week} discipline order mismatch. "
+                    f"Event {event_number} discipline order mismatch. "
                     f"Expected {DISCIPLINE_ORDER}, got {order}."
                 )
 
@@ -550,9 +593,9 @@ def _add_feedback_context(prompt: str, feedback: str | None) -> str:
 
 
 def _add_cross_reference_instruction(prompt: str) -> str:
-    """Add instruction for same-week events to reference each other."""
+    """Add instruction for same-event-number events to reference each other."""
     prompt += (
-        "\n\nCROSS-DISCIPLINE REFERENCES: Events in the same week MUST "
+        "\n\nCROSS-DISCIPLINE REFERENCES: Events with the same event_number MUST "
         "explicitly reference each other and form a causal chain. The Business "
         "event presents a real-world observation or development. The Systems "
         "Engineer event is a direct consequence — what does this observation "
@@ -574,17 +617,17 @@ def _build_single_event_prompt(
     codebase_context: str | None = None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    week_number: int | None = None,
+    event_number: int | None = None,
     deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
-    week_label = f"Week {week_number}" if week_number else "a week"
+    event_label = f"Event {event_number}" if event_number else "an event"
     prompt = (
-        f"Generate EXACTLY ONE event — a single event — for {week_label} "
+        f"Generate EXACTLY ONE event — a single event — for {event_label} "
         f"for an intern in the '{discipline}' discipline. ONLY '{discipline}' "
         f"— do not generate events for any other discipline.\n\n"
         f"OUTPUT EXACTLY ONE EVENT. Do NOT generate a second event. "
-        f"Do NOT generate Week 2 or any continuation. ONE event only.\n\n"
+        f"Do NOT generate Event 2 or any continuation. ONE event only.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for {discipline}:\n{guidance}\n\n"
         f"Required deliverable count for this event: {deliverables_per_event}. "
@@ -613,19 +656,19 @@ def _build_set_prompt(
     codebase_context: str | None = None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    week_number: int = 1,
+    event_number: int = 1,
     deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
     prompt = (
-        f"Generate EXACTLY ONE weekly event for Week {week_number} "
+        f"Generate EXACTLY ONE event for Event {event_number} "
         f"for an intern in the '{discipline}' discipline. "
         f"ONLY '{discipline}' — do not generate events for any other discipline. "
         f"Every event must have **Discipline:** {discipline}.\n\n"
-        f"OUTPUT EXACTLY ONE EVENT. Do NOT generate an extra week.\n\n"
+        f"OUTPUT EXACTLY ONE EVENT. Do NOT generate an extra event.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for {discipline}:\n{guidance}\n\n"
-        f"This event must continue the project narrative from prior weeks. "
+        f"This event must continue the project narrative from prior events. "
         f"It should be a consequence of, or build on, earlier events. "
         f"The project is alive — things happen because of what came before.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
@@ -643,7 +686,7 @@ def _build_set_prompt(
         )
     prompt += (
         PROMPT_CLOSER +
-        " Generate ONLY ONE event for this week."
+        " Generate ONLY ONE event for this event_number."
     )
     return prompt
 
@@ -653,7 +696,7 @@ def _build_all_disciplines_prompt(
     codebase_context: str | None = None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    week_number: int = 1,
+    event_number: int = 1,
     cross_reference: bool = False,
     deliverables_per_event: int = 2,
 ) -> str:
@@ -661,20 +704,20 @@ def _build_all_disciplines_prompt(
         f"### {disc}\n{g}" for disc, g in DISCIPLINE_GUIDANCE.items()
     )
     prompt = (
-        f"Generate a coordinated set of weekly events for THREE interns "
+        f"Generate a coordinated set of events for THREE interns "
         f"working on the same project, one in each discipline: "
         f"Business, Systems Engineer, and Developer.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for each role:\n{all_guidance}\n\n"
-        f"Generate events for Week {week_number} only (exactly 3 events total).\n\n"
-        f"CAUSAL CHAIN: This week should tell a coherent story across all "
+        f"Generate events for Event {event_number} only (exactly 3 events total).\n\n"
+        f"CAUSAL CHAIN: This event should tell a coherent story across all "
         f"three disciplines. The Business intern observes or discovers something "
         f"in the real world. The Systems Engineer must react to that discovery "
         f"at the architecture/model level. The Developer must build or change "
         f"something because of the SE's response.\n\n"
-        f"IMPORTANT — Organize the output by week values in JSON.\n"
-        f"Use week={week_number} for every event this call.\n\n"
-        f"STRICT ORDER: Within each week, the event order must be exactly: "
+        f"IMPORTANT — Organize the output by event_number values in JSON.\n"
+        f"Use event_number={event_number} for every event this call.\n\n"
+        f"STRICT ORDER: Within each event_number, the event order must be exactly: "
         f"Business, then Systems Engineer, then Developer.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
         f"Each event must include exactly {deliverables_per_event} objects in "
@@ -693,7 +736,7 @@ def _build_all_disciplines_prompt(
         )
     prompt += (
         PROMPT_CLOSER +
-        " Generate ONLY Week " + str(week_number) + " with exactly 3 events."
+        " Generate ONLY Event " + str(event_number) + " with exactly 3 events."
     )
     return prompt
 
@@ -736,11 +779,11 @@ def generate_events(
     project_description: str,
     mode: str,
     discipline: str | None,
-    num_weeks: int,
+    num_events: int,
     uploaded_files=None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    start_week: int = 1,
+    start_event: int = 1,
     cross_reference: bool = False,
     deliverables_per_event: int = 2,
     codebase_context: str | None = None,
@@ -758,40 +801,40 @@ def generate_events(
         One of "single", "set", "all".
     discipline : str or None
         Required for "single" and "set" modes.
-    num_weeks : int
-        Preserved for compatibility; generation is enforced to one week per call.
+    num_events : int
+        Preserved for compatibility; generation is enforced to one event per call.
     uploaded_files : list or None
         Streamlit uploaded file objects for codebase context.
     previous_events : str or None
         Markdown text of previously generated events for continuity.
     feedback : str or None
         User feedback to steer the generation.
-    start_week : int
-        Starting week number for generated events.
+    start_event : int
+        Starting event number for generated events.
     cross_reference : bool
-        Whether same-week events across disciplines should reference each other.
+        Whether same-event-number events across disciplines should reference each other.
     """
     global LAST_GENERATION_WARNING
     LAST_GENERATION_WARNING = None
 
-    # Enforce single-week generation per invocation.
-    num_weeks = 1
+    # Enforce single-event generation per invocation.
+    num_events = 1
     codebase_context = _normalize_codebase_context(uploaded_files, codebase_context)
 
     if mode == "single":
         user_prompt = _build_single_event_prompt(
             project_description, discipline, codebase_context,
-            previous_events, feedback, start_week, deliverables_per_event,
+            previous_events, feedback, start_event, deliverables_per_event,
         )
     elif mode == "set":
         user_prompt = _build_set_prompt(
             project_description, discipline, codebase_context,
-            previous_events, feedback, start_week, deliverables_per_event,
+            previous_events, feedback, start_event, deliverables_per_event,
         )
     else:
         user_prompt = _build_all_disciplines_prompt(
             project_description, codebase_context,
-            previous_events, feedback, start_week, cross_reference,
+            previous_events, feedback, start_event, cross_reference,
             deliverables_per_event,
         )
 
@@ -818,8 +861,8 @@ def generate_events(
             events=events,
             mode=mode,
             discipline=discipline,
-            num_weeks=num_weeks,
-            start_week=start_week,
+            num_events=num_events,
+            start_event=start_event,
             deliverables_per_event=deliverables_per_event,
             previous_artifacts=previous_artifacts,
         )
