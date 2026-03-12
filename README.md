@@ -13,6 +13,7 @@ The project supports two run modes:
   - Single event
   - One-week generation for one discipline
   - One-week generation for all disciplines
+- Multi-week actions are orchestrated as repeated one-week API calls (`/generate-week`)
 - Maintains timeline history in session state
 - Supports regeneration, continuation, and download of the full timeline
 - Generates one week at a time only (no multi-week batch generation)

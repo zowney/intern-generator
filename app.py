@@ -4,10 +4,9 @@ Generates realistic weekly events for interns using local Ollama models.
 """
 
 import streamlit as st
+from generation_api import request_generate_week, start_local_api_server
 from generator import (
-    generate_events,
     get_available_models,
-    get_last_generation_warning,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,6 +34,9 @@ DEFAULTS = {
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
+
+# Ensure the local generation API is running for this app process.
+start_local_api_server()
 
 # ---------------------------------------------------------------------------
 # Minimal custom CSS — solid colors only, no gradients, no emoji
@@ -160,6 +162,23 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Helper: run a generation, stream to a container, update state
 # ---------------------------------------------------------------------------
+def _build_codebase_context(uploaded_file_list) -> str | None:
+    """Serialize uploaded files for API requests."""
+    if not uploaded_file_list:
+        return None
+
+    parts: list[str] = []
+    for uploaded in uploaded_file_list:
+        try:
+            uploaded.seek(0)
+            content = uploaded.read().decode("utf-8", errors="replace")
+            uploaded.seek(0)
+            parts.append(f"--- File: {uploaded.name} ---\n{content}\n")
+        except Exception:
+            parts.append(f"--- File: {uploaded.name} --- (could not read)\n")
+    return "\n".join(parts) if parts else None
+
+
 def run_generation(
     container,
     mode_key: str,
@@ -169,40 +188,67 @@ def run_generation(
     previous_events: str | None,
     feedback_text: str | None = None,
 ):
-    """Stream generation into the given container. Returns the full text or None."""
+    """Generate one week per API call and stream cumulative markdown."""
     warning_area = container.empty()
+    progress_area = container.empty()
     output_area = container.empty()
-    full_response = ""
+    warnings: list[str] = []
+    week_chunks: list[str] = []
+    generated_weeks = 0
+    codebase_context = _build_codebase_context(uploaded_files)
+    current_previous = previous_events
 
     try:
-        for token in generate_events(
-            model=selected_model,
-            project_description=project_description.strip(),
-            mode=mode_key,
-            discipline=disc,
-            num_weeks=weeks,
-            uploaded_files=uploaded_files,
-            previous_events=previous_events,
-            feedback=feedback_text,
-            start_week=start_week,
-            cross_reference=cross_reference,
-            deliverables_per_event=int(deliverables_per_event),
-        ):
-            full_response += token
-            output_area.markdown(full_response)
+        for offset in range(weeks):
+            current_week = start_week + offset
+            progress_area.markdown(
+                f"Generating week {current_week} "
+                f"({offset + 1}/{weeks})..."
+            )
+            response = request_generate_week(
+                {
+                    "model": selected_model,
+                    "project_description": project_description.strip(),
+                    "mode": mode_key,
+                    "discipline": disc,
+                    "start_week": current_week,
+                    "previous_events": current_previous,
+                    "feedback": feedback_text,
+                    "cross_reference": cross_reference,
+                    "deliverables_per_event": int(deliverables_per_event),
+                    "codebase_context": codebase_context,
+                }
+            )
+            week_text = (response.get("content") or "").strip()
+            if not week_text:
+                raise RuntimeError(
+                    f"API returned empty content for week {current_week}."
+                )
+            week_chunks.append(week_text)
+            generated_weeks += 1
+            warning_text = response.get("warning")
+            if warning_text:
+                warnings.append(f"Week {current_week}: {warning_text}")
+            current_previous = (
+                f"{current_previous}\n\n{week_text}" if current_previous else week_text
+            )
+            output_area.markdown("\n\n".join(week_chunks))
     except Exception as e:
         container.error(f"Generation failed: {e}")
         container.caption(
             "Make sure Ollama is running locally and the selected model is "
             "available. You can pull a model with: ollama pull <model-name>"
         )
-        return None
+        if not week_chunks:
+            return None, 0
+    finally:
+        progress_area.empty()
 
-    warning_text = get_last_generation_warning()
-    if warning_text:
-        warning_area.warning(warning_text)
+    if warnings:
+        warning_area.warning("\n".join(warnings))
 
-    return full_response if full_response else None
+    full_response = "\n\n".join(week_chunks)
+    return (full_response if full_response else None), generated_weeks
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +295,7 @@ if st.session_state.event_history:
 
         if action == "regenerate":
             # Remove the last generation and regenerate it
-            last_text = st.session_state.event_history.pop()
+            st.session_state.event_history.pop()
             st.session_state.week_counter -= st.session_state.last_weeks
             start_week = st.session_state.week_counter + 1
             weeks = st.session_state.last_weeks
@@ -261,12 +307,14 @@ if st.session_state.event_history:
 
             with streaming_container:
                 st.markdown("**Regenerating with feedback...**")
-                result = run_generation(
+                result, generated = run_generation(
                     streaming_container, m, d, weeks, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
-                st.session_state.week_counter += weeks
+                st.session_state.week_counter += generated
+                st.session_state.last_weeks = generated
+                st.session_state.last_mode = m
 
         elif action == "continue_1":
             start_week = st.session_state.week_counter + 1
@@ -274,13 +322,13 @@ if st.session_state.event_history:
 
             with streaming_container:
                 st.markdown("**Generating next week...**")
-                result = run_generation(
+                result, generated = run_generation(
                     streaming_container, m, d, 1, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
-                st.session_state.week_counter += 1
-                st.session_state.last_weeks = 1
+                st.session_state.week_counter += generated
+                st.session_state.last_weeks = generated
 
         elif action == "continue_n":
             weeks = st.session_state.pending_weeks
@@ -292,13 +340,13 @@ if st.session_state.event_history:
 
             with streaming_container:
                 st.markdown(f"**Generating next {weeks} weeks...**")
-                result = run_generation(
+                result, generated = run_generation(
                     streaming_container, m, d, weeks, start_week, previous, fb
                 )
             if result:
                 st.session_state.event_history.append(result)
-                st.session_state.week_counter += weeks
-                st.session_state.last_weeks = weeks
+                st.session_state.week_counter += generated
+                st.session_state.last_weeks = generated
                 st.session_state.last_mode = m
 
         # Clear the pending action and rerun to show clean state
@@ -399,13 +447,13 @@ else:
             mode_key = "all"
 
         container = st.container()
-        result = run_generation(
+        result, generated = run_generation(
             container, mode_key, discipline, num_weeks, 1, None
         )
         if result:
             st.session_state.event_history.append(result)
-            st.session_state.week_counter += num_weeks
+            st.session_state.week_counter += generated
             st.session_state.last_mode = mode_key
             st.session_state.last_discipline = discipline
-            st.session_state.last_weeks = num_weeks
+            st.session_state.last_weeks = generated
             st.rerun()

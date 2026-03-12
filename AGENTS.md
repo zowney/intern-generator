@@ -14,8 +14,9 @@ Both variants should remain behaviorally aligned.
 
 1. User selects model, mode, discipline, and deliverable count.
 2. User provides project description and optional uploaded code files.
-3. Generator builds prompt(s), calls model, validates output, retries repair up to 3 times.
-4. UI displays output, warning state (if needed), and timeline history controls.
+3. App calls local generation API (`/generate-week`) once per week requested.
+4. Generator builds prompt(s), calls model, validates output, retries repair up to 3 times.
+5. UI displays output, warning state (if needed), and timeline history controls.
 
 ## Output Requirements
 

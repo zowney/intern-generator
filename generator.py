@@ -443,24 +443,23 @@ def _build_single_event_prompt(
 def _build_set_prompt(
     project_description: str,
     discipline: str,
-    num_weeks: int,
     codebase_context: str | None = None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    start_week: int = 1,
+    week_number: int = 1,
     deliverables_per_event: int = 2,
 ) -> str:
     guidance = DISCIPLINE_GUIDANCE.get(discipline, "")
-    end_week = start_week + num_weeks - 1
     prompt = (
-        f"Generate a set of {num_weeks} weekly events (Week {start_week} through "
-        f"Week {end_week}) for an intern in the '{discipline}' discipline. "
+        f"Generate EXACTLY ONE weekly event for Week {week_number} "
+        f"for an intern in the '{discipline}' discipline. "
         f"ONLY '{discipline}' — do not generate events for any other discipline. "
         f"Every event must have **Discipline:** {discipline}.\n\n"
+        f"OUTPUT EXACTLY ONE EVENT. Do NOT generate an extra week.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for {discipline}:\n{guidance}\n\n"
-        f"The events must form a continuous narrative over {num_weeks} weeks. "
-        f"Later events should be consequences of, or build on, earlier ones. "
+        f"This event must continue the project narrative from prior weeks. "
+        f"It should be a consequence of, or build on, earlier events. "
         f"The project is alive — things happen because of what came before.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
         f"Each event must include exactly {deliverables_per_event} bullet "
@@ -475,42 +474,41 @@ def _build_set_prompt(
             f"Reference them if relevant to developer events, but not every "
             f"event needs to involve code.\n\n{codebase_context}"
         )
-    prompt += PROMPT_CLOSER
+    prompt += (
+        PROMPT_CLOSER +
+        " Generate ONLY ONE event for this week. Stop after the --- separator."
+    )
     return prompt
 
 
 def _build_all_disciplines_prompt(
     project_description: str,
-    num_weeks: int,
     codebase_context: str | None = None,
     previous_events: str | None = None,
     feedback: str | None = None,
-    start_week: int = 1,
+    week_number: int = 1,
     cross_reference: bool = False,
     deliverables_per_event: int = 2,
 ) -> str:
     all_guidance = "\n\n".join(
         f"### {disc}\n{g}" for disc, g in DISCIPLINE_GUIDANCE.items()
     )
-    end_week = start_week + num_weeks - 1
     prompt = (
         f"Generate a coordinated set of weekly events for THREE interns "
         f"working on the same project, one in each discipline: "
         f"Business, Systems Engineer, and Developer.\n\n"
         f"--- PROJECT README ---\n{project_description}\n--- END README ---\n\n"
         f"Discipline guidance for each role:\n{all_guidance}\n\n"
-        f"Generate events for Week {start_week} through Week {end_week} "
-        f"({num_weeks * 3} events total).\n\n"
-        f"CAUSAL CHAIN: Each week should tell a coherent story across all "
+        f"Generate events for Week {week_number} only (exactly 3 events total).\n\n"
+        f"CAUSAL CHAIN: This week should tell a coherent story across all "
         f"three disciplines. The Business intern observes or discovers something "
         f"in the real world. The Systems Engineer must react to that discovery "
         f"at the architecture/model level. The Developer must build or change "
-        f"something because of the SE's response. Later weeks build on the "
-        f"consequences of earlier weeks.\n\n"
+        f"something because of the SE's response.\n\n"
         f"IMPORTANT — Organize the output BY WEEK, not by discipline:\n"
-        f"# Week N\n"
+        f"## Week {week_number}\n"
         f"Show the Business event, then Systems Engineer event, then Developer "
-        f"event for that week. Then move to the next week.\n\n"
+        f"event for that week.\n\n"
         f"STRICT ORDER: Within each week, the event order must be exactly: "
         f"Business, then Systems Engineer, then Developer.\n\n"
         f"Required deliverable count per event: {deliverables_per_event}. "
@@ -528,7 +526,10 @@ def _build_all_disciplines_prompt(
             f"Reference them if relevant to developer events, but not every "
             f"event needs to involve code.\n\n{codebase_context}"
         )
-    prompt += PROMPT_CLOSER
+    prompt += (
+        PROMPT_CLOSER +
+        " Generate ONLY Week " + str(week_number) + " with exactly 3 events."
+    )
     return prompt
 
 
@@ -551,6 +552,16 @@ def _read_uploaded_files(uploaded_files) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def _normalize_codebase_context(
+    uploaded_files=None,
+    codebase_context: str | None = None,
+) -> str | None:
+    """Use explicit codebase context when provided, otherwise read uploads."""
+    if codebase_context is not None:
+        return codebase_context
+    return _read_uploaded_files(uploaded_files)
+
+
 # ---------------------------------------------------------------------------
 # Main generation entry point
 # ---------------------------------------------------------------------------
@@ -567,6 +578,7 @@ def generate_events(
     start_week: int = 1,
     cross_reference: bool = False,
     deliverables_per_event: int = 2,
+    codebase_context: str | None = None,
 ):
     """
     Generator that yields streamed text from Ollama.
@@ -582,7 +594,7 @@ def generate_events(
     discipline : str or None
         Required for "single" and "set" modes.
     num_weeks : int
-        Number of weeks (events) to generate.
+        Preserved for compatibility; generation is enforced to one week per call.
     uploaded_files : list or None
         Streamlit uploaded file objects for codebase context.
     previous_events : str or None
@@ -597,7 +609,9 @@ def generate_events(
     global LAST_GENERATION_WARNING
     LAST_GENERATION_WARNING = None
 
-    codebase_context = _read_uploaded_files(uploaded_files)
+    # Enforce single-week generation per invocation.
+    num_weeks = 1
+    codebase_context = _normalize_codebase_context(uploaded_files, codebase_context)
 
     if mode == "single":
         user_prompt = _build_single_event_prompt(
@@ -606,12 +620,12 @@ def generate_events(
         )
     elif mode == "set":
         user_prompt = _build_set_prompt(
-            project_description, discipline, num_weeks, codebase_context,
+            project_description, discipline, codebase_context,
             previous_events, feedback, start_week, deliverables_per_event,
         )
     else:
         user_prompt = _build_all_disciplines_prompt(
-            project_description, num_weeks, codebase_context,
+            project_description, codebase_context,
             previous_events, feedback, start_week, cross_reference,
             deliverables_per_event,
         )
